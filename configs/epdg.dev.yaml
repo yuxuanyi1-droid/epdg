@@ -7,25 +7,17 @@ ipsec:
   connection_name: epdg-ike
   child_prefix: ue
 aaa:
-  backend: swm_tcp_probe
+  backend: noop
   origin_host: epdg.localdomain
   origin_realm: localdomain
-  destination_host: hss.localdomain
-  destination_realm: localdomain
-  eap_provider: unsupported
-  eap_max_rounds: 4
 protocol:
   plmn:
     mcc: "001"
-    mnc: "01"
+    mnc: "001"
   swu:
     local_address: 10.46.0.2
     ike_port: 500
     natt_port: 4500
-  swm:
-    peer_host: 127.0.0.8
-    realm: localdomain
-    port: 3868
   s2b:
     backend: noop
     pgw_address: 127.0.0.4

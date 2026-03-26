@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--This is the default iFC template used by PyHSS, variables come from the Jinja2 template passed inside diameter.py where you can additional variables if required -->
+<Sh-Data>
+    <IMSPrivateUserIdentity>{{ Sh_template_vars['imsi'] }}@ims.mnc{{ Sh_template_vars['mnc'] }}.mcc{{ Sh_template_vars['mcc'] }}.3gppnetwork.org</IMSPrivateUserIdentity>
+    <!-- This provides the Public Identifiers to the Application Server -->
+    <PublicIdentifiers>
+        <IMSPublicIdentity>sip:{{ Sh_template_vars['msisdn'] }}@ims.mnc{{ Sh_template_vars['mnc'] }}.mcc{{ Sh_template_vars['mcc'] }}.3gppnetwork.org</IMSPublicIdentity>
+        <MSISDN>{{ Sh_template_vars['msisdn'] }}</MSISDN>
+    </PublicIdentifiers>
+
+    <!-- This optional extension provides the Location of the serving MME for this subscriber and the TAC for the ULA -->
+    <Extension>
+        <EPSLocationInformation>{% if Sh_template_vars['serving_mme'] is not none %}
+            <E-UTRANCellGlobalId></E-UTRANCellGlobalId>
+            <TrackingAreaId></TrackingAreaId>
+            <MMEName>{{ Sh_template_vars['serving_mme'] }}</MMEName>
+            <AgeOfLocationInformation>0</AgeOfLocationInformation>
+            <Extension>
+                <VisitedPLMNID></VisitedPLMNID>
+            </Extension>{% endif %}          
+        </EPSLocationInformation>
+    </Extension>
+
+    <Sh-IMS-Data>
+        <S-CSCFName>{{ Sh_template_vars['scscf'] }}</S-CSCFName>
+        <IMSUserState>{{ Sh_template_vars['imsUserState'] }}</IMSUserState>
+        <!-- The following values are not 3gpp-standardised. Remove if your deployment requires 3gpp-compliant XML. -->
+        <InboundCommunicationBarred>{{ Sh_template_vars['inboundCommunicationBarred'] }}</InboundCommunicationBarred>
+        <OutboundCommunicationBarred>{{ Sh_template_vars['outboundCommunicationBarred'] }}</OutboundCommunicationBarred>
+        <CallForwardActive>{{ Sh_template_vars['callForwarding']['enabled'] }}</CallForwardActive>
+        <CallForwardUnconditional>{{ Sh_template_vars['callForwarding']['unconditional'] }}</CallForwardUnconditional>
+        <CallForwardNotRegistered>{{ Sh_template_vars['callForwarding']['notRegistered'] }}</CallForwardNotRegistered>
+        <CallForwardNoAnswer>{{ Sh_template_vars['callForwarding']['noAnswer'] }}</CallForwardNoAnswer>
+        <CallForwardBusy>{{ Sh_template_vars['callForwarding']['busy'] }}</CallForwardBusy>
+        <CallForwardNotReachable>{{ Sh_template_vars['callForwarding']['notReachable'] }}</CallForwardNotReachable>
+        <CallForwardNoReplyTimer>{{ Sh_template_vars['callForwarding']['noReplyTimer'] }}</CallForwardNoReplyTimer>
+    </Sh-IMS-Data>
+
+</Sh-Data>

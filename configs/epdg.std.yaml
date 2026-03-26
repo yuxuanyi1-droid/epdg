@@ -9,25 +9,20 @@ ipsec:
   child_prefix: ue
   child_name: ue-default
 aaa:
-  backend: swm_diameter_eap
+  backend: pyhss_api
   origin_host: epdg.localdomain
   origin_realm: localdomain
-  destination_host: swm-handler.localdomain
-  destination_realm: localdomain
-  eap_provider: nak_only
-  eap_max_rounds: 4
+  pyhss_api:
+    base_url: http://127.0.0.1:8080
+    timeout_seconds: 5
 protocol:
   plmn:
     mcc: "001"
-    mnc: "01"
+    mnc: "001"
   swu:
     local_address: 10.46.0.2
     ike_port: 500
     natt_port: 4500
-  swm:
-    peer_host: 127.0.0.1
-    realm: localdomain
-    port: 13868
   s2b:
     backend: gtpv2_echo
     pgw_address: 127.0.0.4
