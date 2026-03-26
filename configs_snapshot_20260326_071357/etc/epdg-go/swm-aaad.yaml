@@ -1,0 +1,8 @@
+listen: "127.0.0.19:3869"
+origin_host: "swm-handler.localdomain"
+origin_realm: "localdomain"
+product_name: "swm-aaad"
+allow_unknown_imsi: true
+allowed_imsis: []
+read_timeout: 0s
+session_timeout: 2m
