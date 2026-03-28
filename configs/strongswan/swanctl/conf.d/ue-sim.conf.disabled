@@ -1,0 +1,35 @@
+connections {
+  ue-sim {
+    version = 2
+    local_addrs = 192.168.216.135
+    remote_addrs = 192.168.216.133
+    proposals = aes128-sha1-modp2048,aes128-sha1-modp1024,aes256-sha256-modp2048
+
+    local {
+      auth = eap-aka
+      id = 0001010000000001@nai.epc.mnc001.mcc001.3gppnetwork.org
+    }
+
+    remote {
+      auth = pubkey
+      id = epdg.localdomain
+      certs = epdg.crt
+    }
+
+    children {
+      ue-sim {
+        local_ts = dynamic
+        remote_ts = 0.0.0.0/0
+        esp_proposals = aes128-sha1,aes256-sha256
+        start_action = trap
+      }
+    }
+  }
+}
+
+secrets {
+  eap-imsi001010000000001 {
+    id = 0001010000000001@nai.epc.mnc001.mcc001.3gppnetwork.org
+    secret = 0x465B5CE8B199B49FAA5F0A2EE238A6BCE8ED289DEBA9526743BA151B062835CC
+  }
+}
