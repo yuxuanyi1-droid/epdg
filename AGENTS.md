@@ -81,3 +81,92 @@ sudo -E SWAN=<prefix> test/integration/swu_eap_aka.sh   # real end to end test
 - RADIUS Message-Authenticator of a *reply* is HMAC-MD5 with the **Request**
   Authenticator in the header field, and the Response Authenticator is computed
   afterwards over the packet that already carries the Message-Authenticator.
+
+## S2b / Open5GS
+
+- **Open5GS needs Diameter peers for S2b.** An S2b session is WLAN RAT type, and
+  `smf_s5c_handle_create_session_request` refuses to proceed unless a Gx peer and
+  an S6b peer are connected (`ogs_diam_is_relay_or_app_advertised`). There is no
+  way to disable either at build time. `test/integration/diampeer` stands in for
+  both; its CER must advertise Gx (16777238) and S6b (16777272) as
+  Vendor-Specific-Application-Id groups with Vendor-Id 10415. Do **not**
+  advertise Gy: that flips `smf_use_gy_iface()` to "enabled" and the SMF then
+  requires an OCS.
+- **The mandatory S2b information elements**, per Open5GS's own ePDG test harness
+  (`tests/non3gpp/s2b-build.c`) and `smf_s5c_handle_create_session_request`:
+  IMSI, Serving Network, RAT Type WLAN, Sender F-TEID C-plane (interface type 30),
+  APN, Selection Mode, **PDN Address Allocation**, AMBR, and a Bearer Context
+  containing EBI, Bearer QoS and the **ePDG S2b U-plane F-TEID** as instance 5
+  (interface type 31). Omitting the PAA gives "No PAA"; omitting the U-plane
+  F-TEID gives "No S2b ePDG GTP-U TEID".
+- **Delete Session is addressed to the peer C-plane TEID.** The SMF resolves the
+  session with `smf_sess_find_by_teid(gtp2_message.h.teid)`, so a request with
+  TEID 0 is answered with cause 64 (Context Not Found). The ePDG has to keep the
+  PGW C-plane TEID from the Create Session Response.
+- **The PGW C-plane F-TEID is the instance 1 F-TEID** in the Create Session
+  Response (`PGWS5S8FTEIDC`), and the PGW U-plane F-TEID lives in the bearer
+  context with interface type 33 (S2b U PGW GTP-U).
+- **`open5gs-upfd` cannot run without `/dev/net/tun`** (it opens `ogstun` for the
+  session subnet, and `upf.session.subnet` is mandatory). `open5gs-sgwud` is a
+  pure PFCP/GTP-U user plane with no subnet requirement and works as the PFCP
+  peer instead, which is enough for the S2b control plane.
+- **freeDiameter requires TLS material even for plain TCP peers**: omitting
+  `TLS_Cred`/`TLS_CA` from the SMF's `smf.conf` aborts start up with "Missing
+  private key configuration for TLS".
+- **Diameter encoding rules that cost several iterations** (RFC 6733 and 3GPP
+  TS 29.2xx): the AVP Length field excludes padding (so a parser must advance to
+  the next 4-octet boundary), the command code is three octets with the
+  Application-Id starting at octet 8, Host-IP-Address needs a two-octet Address
+  family prefix, Vendor-Id is a base AVP without the V bit, Session-Id must be
+  the first AVP (`RULE_FIXED_HEAD`) or the answer is dropped with "failed the
+  dictionary / rules parsing", Auth-Request-Type is AVP 274 (AVP 1 is
+  User-Name), and QoS-Class-Identifier is 4 octets inside a grouped ARP.
+
+## IMS / Kamailio (work in progress)
+
+The IMS side is not covered by an automated test yet. What is established and
+what blocks it:
+
+- Kamailio and every IMS module the P/I/S-CSCF configs need are packaged
+  (`kamailio-ims-modules`, `kamailio-mysql-modules`, `kamailio-extra-modules`,
+  `kamailio-presence-modules`, ...), and the IMS database from
+  `database/kamailio/kamailio_ims.sql` restores cleanly into MariaDB.
+- The three CSCFs need `mysql://<role>:heslo@127.0.0.1/<role>` users and a
+  `/run/kamailio_<role>` directory for the `ctl` module's binrpc socket; without
+  the directory `ctl` fails its `bind` and kamailio exits.
+- `pcscf.cfg` listens on `10.255.0.1` and `10.46.0.1` from the original lab;
+  `10.255.0.1` has to be repointed at whatever address the test topology uses.
+- **Blocker: PyHSS's Cx handshake.** Kamailio's `cdp` connects to
+  `hss.localdomain:3868` but PyHSS's `diameterService.py` closes the connection
+  instead of answering the CER. Two things are needed for it: Redis must be
+  running (without it the service dies in `writeOutboundData` with an
+  `IndexError` from the Redis client), and even with Redis the CER is still not
+  answered. Until Cx works the S-CSCF cannot fetch AKA vectors (`ims_auth` MAR),
+  so no 401 challenge can be produced and the IMS REGISTER flow cannot be
+  tested end to end.
+
+### Building Open5GS for the S2b test
+
+```bash
+apt install -y meson ninja-build build-essential pkg-config libssl-dev \
+    libgcrypt20-dev libsctp-dev libyaml-dev libcurl4-openssl-dev \
+    libtalloc-dev libmongoc-dev libmicrohttpd-dev libidn11-dev cmake
+git clone --depth 1 https://github.com/open5gs/open5gs
+cd open5gs
+meson setup build --prefix=/tmp/it/o5gs -Dbuildtype=debug
+ninja -C build && ninja -C build install
+```
+
+### Building strongSwan for the SWu test
+
+Debian does not package the `eap-aka-3gpp` test card, so a UE that can compute
+AKA vectors requires a source build:
+
+```bash
+./configure --prefix=/tmp/it/swan --sysconfdir=/tmp/it/swan/etc \
+    --enable-eap-aka-3gpp --enable-eap-radius --enable-eap-aka \
+    --enable-eap-identity --enable-vici --enable-swanctl \
+    --enable-kernel-netlink --enable-openssl
+make -j4 && make install
+```
+

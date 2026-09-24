@@ -87,17 +87,49 @@ UE ──IKEv2/EAP-AKA──▶ strongSwan charon (responder, eap-radius)
 
 ## 测试
 
-协议一致性单元测试（使用 RFC / 3GPP 以及独立实现生成的已知答案向量）：
+### 协议一致性单元测试
+
+使用 RFC / 3GPP 以及独立实现生成的已知答案向量，不需要任何外部服务：
 
 ```bash
 go test ./...
 ```
 
-真实环境联调（两个 strongSwan charon + 真实 PyHSS + 真实内核 XFRM，无 mock）：
+覆盖内容：EAP-AKA 密钥派生（对齐 strongSwan 自身的 FIPS PRF 测试向量）、EAP-AKA
+challenge 的逐字节编码、RADIUS Access-Challenge 的逐字节编码（与独立实现一致）、
+RFC 2548 MS-MPPE 加密、GTPv2-C S2b 必需 IE 与响应解析、配置加载。
+
+### SWu + EAP-AKA 真实联调
+
+两个 strongSwan charon（ePDG 侧 `eap-radius`，UE 侧 `eap-aka-3gpp` 测试卡）+ 真实
+PyHSS + 真实内核 XFRM，无 mock，**23/23 通过**：
 
 ```bash
 sudo -E SWAN=/path/to/strongswan-prefix test/integration/swu_eap_aka.sh
 ```
 
-该脚本断言 IKE_SA/CHILD_SA 在两端进入 ESTABLISHED/INSTALLED、ePDG 从地址池分配内层地址、
-隧道内 ICMP 可达，以及两端都安装了真实 ESP 状态。详见脚本头部注释。
+断言：两端 IKE_SA `ESTABLISHED`、CHILD_SA `INSTALLED`、ePDG 从地址池分配内层地址、
+隧道内 ICMP 可达、两端均安装真实 ESP 状态。
+
+### S2b + Open5GS 真实联调
+
+真实 Open5GS PGW-C（`open5gs-smfd`）+ 真实 PFCP 用户面（`open5gs-sgwud`），
+无 mock，**18/18 通过**：
+
+```bash
+sudo -E OPEN5GS_BIN=/path/to/open5gs/bin OPEN5GS_PREFIX=/path/to/open5gs \
+  test/integration/s2b_open5gs.sh
+```
+
+断言：PGW-C 接受 Create Session Request 并从自己的地址池分配 PDN 地址、返回 cause 16
+与 C/U 面 F-TEID、Delete Session 正常释放；并以 PGW-C 自身发出的 S6b AAR/STR 与
+Gx CCR-I/CCR-T 作为独立佐证。
+
+该测试中 PCRF 与 3GPP AAA 由 `test/integration/diampeer` 充当测试替身——这两个
+Diameter 对端不属于本仓库的交付范围，但 PGW-C 在没有它们时会拒绝建立会话。
+
+### 尚未自动化覆盖
+
+Kamailio IMS 侧（`401 -> 200 OK` 的 REGISTER 流程）尚无自动化测试。已确认的前置
+条件与当前阻塞点记录在 `AGENTS.md` 的 “IMS / Kamailio” 一节：关键阻塞是 PyHSS
+的 Diameter 服务不回应 Kamailio `cdp` 的 CER，导致 Cx（MAR）拿不到鉴权向量。

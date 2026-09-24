@@ -6,3 +6,6 @@
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Redis snapshot left behind by local test runs
+/dump.rdb
