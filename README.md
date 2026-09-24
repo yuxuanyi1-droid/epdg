@@ -1,78 +1,103 @@
-# ePDG 控制面
+# ePDG 控制面（Go 实现）
 
-这个仓库现在的主线是：
+本仓库的主线是**基于 Go 实现的 ePDG 控制面**，配合以下四个既有组件形成完整链路：
 
-- `pyepdg/`：Python 版 ePDG 控制面与会话编排
-- `pyhss/`：官方 PyHSS 代码树，承担 HSS 和 AAA 能力
+| 组件 | 角色 | 与本仓库的关系 |
+|------|------|----------------|
+| **strongSwan** | SWu 数据面：IKEv2 / IPsec / EAP 中继 | 通过 **VICI 协议**驱动 charon；`eap-radius` 把 EAP-AKA 交给本仓库的 RADIUS 服务 |
+| **PyHSS** | HSS / AuC：Milenage 算法与鉴权向量 | 原始代码树保留在 `pyhss/`，ePDG 通过其 REST API 取 AKA 五元组 |
+| **Open5GS** | EPC：MME / HSS / PCRF / SGW / PGW | ePDG 通过 **S2b（GTPv2-C）** 与其 SGW-C/PGW-C 交互 |
+| **Kamailio** | IMS：P-CSCF / I-CSCF / S-CSCF | ePDG 负责 P-CSCF 发现与隧道内的 SIP 通路 |
 
-外部组件仍然保持独立：
-
-- `strongSwan`：承载 SWu / IKEv2 / IPsec
-- `Kamailio`：承载 IMS 的 P-CSCF / I-CSCF / S-CSCF
-- `Open5GS`：承载 EPC 必要网元
+控制面语言由 Python 改为 Go。原因：重写后 ePDG 需要自己实现 **RADIUS + EAP-AKA（RFC 4187）**、
+**GTPv2-C（TS 29.274）** 与 **VICI** 这几层协议，Go 在本仓库涉及的每个集成点上都有成熟且被
+生产使用的协议库（strongSwan 官方 govici、wmnsk/go-gtp 等），同时具备静态类型与单二进制部署。
 
 ## 目录
 
 ```text
-pyepdg/                   # Python ePDG 控制面
-pyhss/                    # PyHSS 源码
-configs/epdg/             # ePDG 配置示例
-configs/kamailio/         # IMS 配置
-configs/open5gs/          # EPC 配置
-configs/strongswan/       # strongSwan/ePDG 配置
-configs/pyhss/            # PyHSS 运行配置备份
-database/                 # 数据库备份与恢复脚本
-docs/                     # 分模块部署文档
-test/                     # SWu + VoWiFi 注册联调脚本
+cmd/epdgd/            # 控制面入口
+internal/eap/         # EAP（RFC 3748）与 EAP-AKA（RFC 4187），含 FIPS 186-2 PRF
+internal/radius/      # RADIUS 编解码、Message-Authenticator、RFC 2548 MS-MPPE 密钥
+internal/aaa/         # RADIUS EAP-AKA 服务端（对接 strongSwan eap-radius）
+internal/hss/         # PyHSS REST 客户端（取 AKA 五元组）
+internal/ipsec/       # strongSwan 驱动：VICI 后端 / swanctl 后端 / noop
+internal/gtpv2/       # S2b GTPv2-C 消息（基于 go-gtp 编解码）
+internal/s2b/         # S2b 会话生命周期适配
+internal/session/     # 会话表
+internal/server/      # HTTP 管理 API 与就绪检查
+internal/compliance/  # 就绪检查框架
+configs/              # ePDG / strongSwan / Kamailio / Open5GS / PyHSS 配置
+database/             # 数据库备份与恢复脚本
+docs/                 # 分模块文档
+test/                 # 单元测试与真实环境联调脚本
+pyhss/                # PyHSS 源码树（HSS / AAA 能力）
+```
+
+## 构建
+
+```bash
+go build ./...
+go build -o epdgd ./cmd/epdgd
 ```
 
 ## 运行
 
-标准配置直接对接 PyHSS：
-
 ```bash
-python3 -m pyepdg ./configs/epdg/epdg.yaml
+./epdgd -config configs/epdg/epdg.yaml
 ```
 
-开发配置只保留本地编排：
+开发配置（不连接 charon / PyHSS）：
 
 ```bash
-python3 -m pyepdg ./configs/epdg/epdg.dev.yaml
+./epdgd -config configs/epdg/epdg.dev.yaml
 ```
 
-## AAA
+## AAA 链路
 
-ePDG 的 AAA 直接由 PyHSS 提供。
+ePDG 自身就是 EAP-AKA 服务端，链路为：
 
-现在默认通过 PyHSS 的 SWm 风格 API 获取 EAP-AKA 相关数据：
+```text
+UE ──IKEv2/EAP-AKA──▶ strongSwan charon (responder, eap-radius)
+                            │ RADIUS + EAP-Message
+                            ▼
+                     epdgd RADIUS EAP-AKA 服务端
+                            │ GET /auc/aka/vector_count/1/imsi/<imsi>
+                            ▼
+                          PyHSS（Milenage 生成五元组）
+```
 
-- `GET /auc/swm/eap_aka/plmn/<plmn>/imsi/<imsi>`
-- `GET /oam/ping`
+要点：
 
-对应逻辑在 [pyhss/services/apiService.py](/home/yuxuanyi/epdg/pyhss/services/apiService.py) 和 [pyepdg/pyhss_client.py](/home/yuxuanyi/epdg/pyepdg/pyhss_client.py)。
+- 使用 PyHSS 的 `/auc/aka/vector_count/1/imsi/<imsi>`，因为它返回**完整五元组**（含 CK/IK）。
+  `/auc/swm/eap_aka/...` 只返回 RAND/AUTN/XRES，缺 CK/IK，无法推导 EAP-AKA 的 MSK。
+- 密钥派生严格遵循 RFC 4187 §7：`MK = SHA1(Identity|IK|CK)`，
+  `K_encr | K_aut | MSK | EMSK = PRF(MK, 1280)`，PRF 为 FIPS 186-2 附录 A 的 SHA-1 PRF
+  （与 strongSwan 的 `PRF_FIPS_SHA1_160` 一致）。
+- 成功后通过 **MS-MPPE-Recv-Key / MS-MPPE-Send-Key**（RFC 2548）把 MSK 交给 strongSwan，
+  再由 charon 完成 IKE_AUTH 并安装 IPsec SA。
 
 ## API
 
-- `GET /healthz`
-- `GET /v1/sessions`
-- `POST /v1/sessions/create`
-- `POST /v1/sessions/delete`
-- `GET /v1/compliance/check`
+- `GET  /healthz`
+- `GET  /v1/sessions`
+- `POST /v1/sessions/create`  `{"ue_id","imsi","apn"}`
+- `POST /v1/sessions/delete`  `{"ue_id"}`
+- `GET  /v1/compliance/check`
 
-## 当前已验证结果
+## 测试
 
-- SWu IKEv2 + EAP-AKA：可建立 IKE_SA / CHILD_SA
-- IMS REGISTER：`401` 挑战后 `200 OK` 成功
-- P-CSCF：已启用严格 IMS IPsec 回包模式（`STRICT_IMS_IPSEC`）
-
-一键回归命令（当前仓库）：
+协议一致性单元测试（使用 RFC / 3GPP 以及独立实现生成的已知答案向量）：
 
 ```bash
-./test/run.sh
+go test ./...
 ```
 
-## 说明
+真实环境联调（两个 strongSwan charon + 真实 PyHSS + 真实内核 XFRM，无 mock）：
 
-- `configs/epdg/epdg.yaml` 和 `configs/epdg/epdg.std.yaml` 默认指向 PyHSS。
-- `configs/epdg/epdg.dev.yaml` 适合本地调试，不发起真实 IPsec / S2b 动作。
-- 如果后续你想把 PyHSS 再进一步收敛成真正的 Diameter SWm 服务，我们可以在 `pyhss/` 里继续补那层实现。
+```bash
+sudo -E SWAN=/path/to/strongswan-prefix test/integration/swu_eap_aka.sh
+```
+
+该脚本断言 IKE_SA/CHILD_SA 在两端进入 ESTABLISHED/INSTALLED、ePDG 从地址池分配内层地址、
+隧道内 ICMP 可达，以及两端都安装了真实 ESP 状态。详见脚本头部注释。

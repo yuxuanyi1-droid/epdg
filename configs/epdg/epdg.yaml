@@ -2,18 +2,38 @@ node_id: epdg.local
 http:
   listen: ":19090"
 ipsec:
-  backend: swanctl
+  # vici drives charon over its native control socket; use swanctl to shell out
+  # to the CLI instead, or noop for a development run without strongSwan.
+  backend: vici
   mode: passive
+  socket: /run/charon.vici
   swanctl_bin: /usr/sbin/swanctl
   connection_name: epdg-ike
   child_prefix: ue
+  child_name: ue-default
+  timeout_seconds: 5
 aaa:
   backend: pyhss_api
   origin_host: epdg.localdomain
   origin_realm: localdomain
+  destination_host: hss.localdomain
+  destination_realm: localdomain
+  eap_max_rounds: 4
   pyhss_api:
     base_url: http://127.0.0.1:8080
+    # The AKA endpoint returns a full quintuplet (RAND, AUTN, XRES, CK, IK).
+    # The SWm flavoured endpoint omits CK and IK, so it cannot drive EAP-AKA.
+    vector_path_template: /auc/aka/vector_count/1/imsi/{imsi}
+    swm_path_template: /auc/swm/eap_aka/plmn/{plmn}/imsi/{imsi}
+    oam_ping_path: /oam/ping
     timeout_seconds: 5
+radius:
+  # The RADIUS EAP-AKA server that answers strongSwan's eap-radius plugin.
+  backend: eap_aka
+  listen: 127.0.0.1:18120
+  secret: pyhss-radius-secret
+  realm: localdomain
+  require_message_authenticator: true
 protocol:
   plmn:
     mcc: "001"
@@ -22,7 +42,16 @@ protocol:
     local_address: 10.46.0.2
     ike_port: 500
     natt_port: 4500
+  swm:
+    peer_host: 127.0.0.8
+    realm: localdomain
+    port: 3868
   s2b:
+    # gtpv2 establishes a real S2b bearer, gtpv2_echo only verifies the control
+    # plane with an Echo exchange, noop disables S2b entirely.
     backend: gtpv2_echo
     pgw_address: 127.0.0.4
     gtpv2_port: 2123
+    local_address: 10.46.0.2
+    apn: ims
+    timeout_seconds: 2

@@ -2,14 +2,30 @@ node_id: epdg.local.dev
 http:
   listen: ":19091"
 ipsec:
+  # Development profile: no charon interaction, sessions stay pending.
   backend: noop
+  mode: passive
+  socket: /run/charon.vici
   swanctl_bin: /usr/sbin/swanctl
   connection_name: epdg-ike
   child_prefix: ue
+  child_name: ue-default
+  timeout_seconds: 5
 aaa:
   backend: noop
   origin_host: epdg.localdomain
   origin_realm: localdomain
+  pyhss_api:
+    base_url: http://127.0.0.1:8080
+    vector_path_template: /auc/aka/vector_count/1/imsi/{imsi}
+    swm_path_template: /auc/swm/eap_aka/plmn/{plmn}/imsi/{imsi}
+    oam_ping_path: /oam/ping
+    timeout_seconds: 5
+radius:
+  backend: noop
+  listen: 127.0.0.1:18120
+  secret: pyhss-radius-secret
+  realm: localdomain
 protocol:
   plmn:
     mcc: "001"
@@ -22,3 +38,4 @@ protocol:
     backend: noop
     pgw_address: 127.0.0.4
     gtpv2_port: 2123
+    timeout_seconds: 2

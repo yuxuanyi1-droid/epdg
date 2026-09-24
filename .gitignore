@@ -1,0 +1,7 @@
+# Go build output
+/epdgd
+*.test
+
+# Python bytecode
+__pycache__/
+*.pyc

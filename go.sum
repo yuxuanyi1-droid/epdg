@@ -1,0 +1,12 @@
+github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
+github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
+github.com/pascaldekloe/goe v0.1.1 h1:Ah6WQ56rZONR3RW3qWa2NCZ6JAVvSpUcoLBaOmYFt9Q=
+github.com/pascaldekloe/goe v0.1.1/go.mod h1:KSyfaxQOh0HZPjDP1FL/kFtbqYqrALJTaMafFUIccqU=
+github.com/strongswan/govici v0.8.2 h1:0LuY16Z8pRvbA1SW/BBdKcBERpFpwwCXkhLbwETVThQ=
+github.com/strongswan/govici v0.8.2/go.mod h1:Auq9H2J1gSMD3D+r2g9HlUpF5tep/wP0u0fMCfBE+Bw=
+github.com/wmnsk/go-gtp v0.8.12 h1:89Xn0q8LTwNP3fYYwZPWVSOuWc7peJrYWWCN9zf6nlM=
+github.com/wmnsk/go-gtp v0.8.12/go.mod h1:ha5DO5jAVVP/2hwrJN5+m1PWOarRusrhduXrAFSPIAE=
+gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405 h1:yhCVgyC4o1eVCa2tZl7eS0r+SDo693bJlVdllGtEeKM=
+gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
+gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
+gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
