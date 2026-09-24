@@ -128,8 +128,21 @@ Gx CCR-I/CCR-T 作为独立佐证。
 该测试中 PCRF 与 3GPP AAA 由 `test/integration/diampeer` 充当测试替身——这两个
 Diameter 对端不属于本仓库的交付范围，但 PGW-C 在没有它们时会拒绝建立会话。
 
+### IMS REGISTER + Kamailio 真实联调
+
+真实 P/I/S-CSCF（Kamailio，使用仓库内 `configs/kamailio/` 配置）+ 真实 PyHSS
+（Cx：UAR/UAA、MAR/MAA、SAR/SAA），UE 用 Milenage 从 AKA nonce 推导 RES 回答
+AKAv1-MD5 挑战，**19/19 通过**：
+
+```bash
+sudo -E PYHSS_PYTHON=/path/to/venv/bin/python test/integration/ims_register.sh
+```
+
+断言：401 挑战（AKAv1-MD5 + Security-Server）、S-CSCF 侧 AKA 响应校验通过、
+HSS 产生 SAA、P-CSCF 记录 200 OK，且 200 OK 经**严格 IMS IPsec**回程送达 UE。
+
+需要 MariaDB、Redis、Kamailio（含 IMS 模块）与带 PyHSS 依赖的 Python 环境。
+
 ### 尚未自动化覆盖
 
-Kamailio IMS 侧（`401 -> 200 OK` 的 REGISTER 流程）尚无自动化测试。已确认的前置
-条件与当前阻塞点记录在 `AGENTS.md` 的 “IMS / Kamailio” 一节：关键阻塞是 PyHSS
-的 Diameter 服务不回应 Kamailio `cdp` 的 CER，导致 Cx（MAR）拿不到鉴权向量。
+无。上述三个联调脚本覆盖 SWu/EAP-AKA、S2b 与 IMS REGISTER 三条链路。

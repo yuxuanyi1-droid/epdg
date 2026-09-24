@@ -122,10 +122,11 @@ sudo -E SWAN=<prefix> test/integration/swu_eap_aka.sh   # real end to end test
   dictionary / rules parsing", Auth-Request-Type is AVP 274 (AVP 1 is
   User-Name), and QoS-Class-Identifier is 4 octets inside a grouped ARP.
 
-## IMS / Kamailio (work in progress)
+## IMS / Kamailio
 
-The IMS side is not covered by an automated test yet. What is established and
-what blocks it:
+Covered by `test/integration/ims_register.sh`: the full `401 -> 200 OK` REGISTER
+with real P/I/S-CSCF, real PyHSS over Cx, and a UE that answers the AKAv1-MD5
+challenge with RES derived through Milenage. Environment notes:
 
 - Kamailio and every IMS module the P/I/S-CSCF configs need are packaged
   (`kamailio-ims-modules`, `kamailio-mysql-modules`, `kamailio-extra-modules`,
@@ -134,16 +135,53 @@ what blocks it:
 - The three CSCFs need `mysql://<role>:heslo@127.0.0.1/<role>` users and a
   `/run/kamailio_<role>` directory for the `ctl` module's binrpc socket; without
   the directory `ctl` fails its `bind` and kamailio exits.
-- `pcscf.cfg` listens on `10.255.0.1` and `10.46.0.1` from the original lab;
-  `10.255.0.1` has to be repointed at whatever address the test topology uses.
-- **Blocker: PyHSS's Cx handshake.** Kamailio's `cdp` connects to
-  `hss.localdomain:3868` but PyHSS's `diameterService.py` closes the connection
-  instead of answering the CER. Two things are needed for it: Redis must be
-  running (without it the service dies in `writeOutboundData` with an
-  `IndexError` from the Redis client), and even with Redis the CER is still not
-  answered. Until Cx works the S-CSCF cannot fetch AKA vectors (`ims_auth` MAR),
-  so no 401 challenge can be produced and the IMS REGISTER flow cannot be
-  tested end to end.
+- `pcscf.cfg` listens on `10.255.0.1` and `10.46.0.1` from the original lab. The
+  test provides them on a dummy interface (`ims-lab0`) instead of editing the
+  shipped config.
+- **A SIGKILLed kamailio leaves its pid file behind**, and the next start aborts
+  with `daemonize(): running process found in the pid file`. Kill the processes
+  and remove `/run/kamailio_<role>/*.pid` before restarting.
+- The P-CSCF logs rtpengine connection failures while starting (rtpengine is not
+  needed for REGISTER) and only begins serving SIP once that settles, so probe it
+  with a throwaway REGISTER rather than relying on a fixed sleep.
+- **The IMS domain and the IMSI disagree on MNC width.** The I-CSCF/S-CSCF configs
+  and the subscriber's IMPU use `ims.mnc001.mcc001.3gppnetwork.org` (three digit),
+  while the IMSI `001010000000001` and PyHSS's `hss.MNC` carry the two digit form
+  `01`. Building the realm as `mnc${MCC}${MNC}` yields `mnc00101` and the
+  registration fails; keep the two spellings separate.
+- **Strict IMS IPsec changes the return path.** With `STRICT_IMS_IPSEC` the
+  P-CSCF delivers the final response through `ims_ipsec_pcscf`'s
+  `ipsec_forward()` to the port the UE advertised as `port-s` in
+  Security-Client, not back to the source port. A test UE must listen on that
+  port as well, otherwise the 200 OK is produced and then lost.
+- **Blocker (SOLVED, and my earlier diagnosis was wrong).** The Cx interface was
+  never a PyHSS protocol bug. Two operational mistakes made it look like one:
+  1. PyHSS runs as **two** services. `diameterService.py` is only a socket relay:
+     it reads raw bytes into the Redis list `diameter-inbound` and writes raw
+     bytes from `diameter-outbound-<ip>-<port>`. The Diameter logic - including
+     answering the CER with a CEA - lives in `hssService.py`, which consumes
+     `diameter-inbound`, calls `Diameter.generateDiameterResponse()` and pushes
+     the reply onto `diameter-outbound-<ip>-<port>`. Starting only
+     `diameterService.py` leaves the CER unanswered forever (Kamailio cdp logs
+     "connected" then "read on socket returned 0 ... dropping").
+  2. `diameter.py` loads its iFC/Sh templates through
+     `jinja2.FileSystemLoader(searchpath="../")`, a path **relative to the
+     working directory**. The packaged systemd units run with
+     `WorkingDirectory=/etc/pyhss/services/`, so `../default_ifc.xml` resolves to
+     `/etc/pyhss/default_ifc.xml`. Run `hssService.py` from anywhere else and the
+     SAR handler dies with
+     `jinja2.exceptions.TemplateNotFound: 'default_ifc.xml' not found in search
+     path: '../'`, which surfaces at the S-CSCF as
+     `ims_registrar_scscf: async_cdp_callback(): Transaction timeout - did not
+     get SAA` and then a 504 towards the UE. Always start the services with
+     `cd pyhss/services` first.
+- Redis is mandatory for both PyHSS services; without it `hssService.py` cannot
+  read `diameter-inbound` and `diameterService.py` dies in `writeOutboundData`
+  with `IndexError: string index out of range`.
+- **Verified**: with both services started from `pyhss/services/`, Cx reaches
+  `State: I_Open` on the I-CSCF and S-CSCF (`kamcmd -s
+  unix:/run/kamailio_<role>/kamailio_ctl cdp.list_peers`) and the full
+  `401 -> 200 OK` REGISTER completes.
 
 ### Building Open5GS for the S2b test
 
