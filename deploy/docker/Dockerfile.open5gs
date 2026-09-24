@@ -1,0 +1,53 @@
+# Open5GS EPC. Built from source because Debian does not package Open5GS.
+FROM debian:bookworm-slim AS build
+
+ARG OPEN5GS_VERSION=2.7.5
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential cmake pkg-config curl ca-certificates \
+      libssl-dev libgcrypt20-dev libsctp-dev libyaml-dev \
+      libcurl4-openssl-dev libtalloc-dev libmongoc-dev \
+      libmicrohttpd-dev libidn11-dev libnghttp2-dev \
+      meson ninja-build \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+RUN curl -fsSL -o open5gs.tar.gz \
+      "https://github.com/open5gs/open5gs/archive/refs/tags/v${OPEN5GS_VERSION}.tar.gz" \
+ && tar xzf open5gs.tar.gz \
+ && mv "open5gs-${OPEN5GS_VERSION}" open5gs
+
+WORKDIR /src/open5gs
+# The unit tests are not needed in the runtime image and dominate the build time.
+RUN meson setup build --prefix=/usr --sysconfdir=/etc --localstatedir=/var --libdir=lib \
+ && ninja -C build \
+ && ninja -C build install \
+ && rm -rf build
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      libssl3 libgcrypt20 libsctp1 libyaml-0-2 libcurl4 \
+      libtalloc2 libmongoc-1.0-0 libmicrohttpd12 libidn12 \
+      mariadb-client curl iproute2 iputils-ping openssl \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /usr/bin/open5gs-* /usr/bin/
+
+# freeDiameter refuses to start without TLS material, even when every peer is
+# configured No_TLS, so the image carries a self-signed certificate. It is only
+# ever used between containers on the lab bridge.
+RUN mkdir -p /etc/open5gs/default /etc/freeDiameter /etc/open5gs/tls \
+ && openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+      -keyout /etc/open5gs/tls/diameter.key \
+      -out /etc/open5gs/tls/diameter.crt \
+      -subj "/C=IT/O=ePDG Lab/CN=diameter.localdomain" \
+ && cp /etc/open5gs/tls/diameter.crt /etc/open5gs/tls/ca.crt \
+ && mkdir -p /var/log/open5gs
+
+COPY deploy/docker/entrypoint-open5gs.sh /usr/local/bin/entrypoint-open5gs.sh
+RUN chmod +x /usr/local/bin/entrypoint-open5gs.sh
+
+WORKDIR /etc/open5gs/default
+ENTRYPOINT ["/usr/local/bin/entrypoint-open5gs.sh"]

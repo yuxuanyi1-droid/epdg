@@ -1,0 +1,377 @@
+# Containerised ePDG / EPC / IMS lab.
+#
+# Everything here is generated from deploy/lab.yaml: run `labctl render` (or
+# `make lab-render`) after changing that file. The addresses come from
+# deploy/.env, which the labctl render step writes, so nothing in this file
+# hardcodes an address.
+#
+# Profiles (set automatically by labctl through COMPOSE_PROFILES in .env):
+#   core        MariaDB, Redis, PyHSS, the three CSCFs and the ePDG
+#   epc         the Open5GS EPC (MME, SGW-C, SGW-U, SMF/PGW, UPF)
+#   open5gs-hss additionally run Open5GS's own HSS and PCRF (needs MongoDB)
+#   enb         the srsRAN base station
+#
+# strongSwan is not here on purpose: it needs the host network namespace to
+# terminate IPsec. See deploy/README.md.
+
+name: epdg-lab
+
+networks:
+  lab:
+    name: ${LAB_NAME:-epdg-lab}
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${LAB_SUBNET}
+
+volumes:
+  mariadb-data:
+  pyhss-data:
+  mongo-data:
+  open5gs-log:
+  kamailio-log:
+
+services:
+  # ---------------------------------------------------------------- data plane
+  mariadb:
+    image: mariadb:11
+    restart: unless-stopped
+    environment:
+      MARIADB_ALLOW_EMPTY_ROOT_PASSWORD: "1"
+      MARIADB_ROOT_HOST: "%"
+    volumes:
+      - mariadb-data:/var/lib/mysql
+      # The IMS schema and the CSCF users are created on first start.
+      - ../database/kamailio/kamailio_ims.sql:/docker-entrypoint-initdb.d/10-ims.sql:ro
+      - ./runtime/mariadb/init.sql:/docker-entrypoint-initdb.d/20-users.sql:ro
+    networks:
+      lab:
+        ipv4_address: ${IP_MARIADB}
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--protected-mode", "no", "--bind", "0.0.0.0"]
+    networks:
+      lab:
+        ipv4_address: ${IP_REDIS}
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    profiles: ["open5gs-hss"]
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      lab:
+        ipv4_address: ${IP_MONGO}
+
+  # --------------------------------------------------------------------- HSS
+  # PyHSS is three cooperating processes (REST API, the Cx socket relay and the
+  # Diameter logic) that share one address, so they run in one container.
+  pyhss:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.pyhss
+    image: epdg-lab/pyhss:local
+    restart: unless-stopped
+    environment:
+      PYHSS_CONFIG: /config/config.yaml
+    volumes:
+      - ./runtime/pyhss/config.yaml:/config/config.yaml:ro
+      - ./runtime/pyhss/seed.sql:/seed.sql:ro
+      - pyhss-data:/var/lib/pyhss
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks:
+      lab:
+        ipv4_address: ${IP_PYHSS}
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/oam/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # -------------------------------------------------------------------- IMS
+  pcscf:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.kamailio
+    image: epdg-lab/kamailio:local
+    restart: unless-stopped
+    environment:
+      KAM_ROLE: pcscf
+    volumes:
+      - ./runtime/kamailio/pcscf:/etc/kamailio:ro
+      - kamailio-log:/var/log/kamailio
+    # Kamailio allocates its whole shared memory pool up front (shm_force_alloc)
+    # and tries to lock it. The Docker default /dev/shm is 64 MB, which makes the
+    # registrar save path die with SIGSEGV on the first registration.
+    shm_size: "512m"
+    extra_hosts:
+      - "hss.localdomain:${IP_PYHSS}"
+    networks:
+      lab:
+        ipv4_address: ${IP_PCSCF}
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      pyhss:
+        condition: service_healthy
+
+  icscf:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.kamailio
+    image: epdg-lab/kamailio:local
+    restart: unless-stopped
+    environment:
+      KAM_ROLE: icscf
+    volumes:
+      - ./runtime/kamailio/icscf:/etc/kamailio:ro
+      - kamailio-log:/var/log/kamailio
+    # See the P-CSCF service: the default /dev/shm is too small for Kamailio.
+    shm_size: "512m"
+    extra_hosts:
+      - "hss.localdomain:${IP_PYHSS}"
+    networks:
+      lab:
+        ipv4_address: ${IP_ICSCF}
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      pyhss:
+        condition: service_healthy
+
+  scscf:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.kamailio
+    image: epdg-lab/kamailio:local
+    restart: unless-stopped
+    environment:
+      KAM_ROLE: scscf
+    volumes:
+      - ./runtime/kamailio/scscf:/etc/kamailio:ro
+      - kamailio-log:/var/log/kamailio
+    # See the P-CSCF service: the default /dev/shm is too small for Kamailio.
+    shm_size: "512m"
+    extra_hosts:
+      - "hss.localdomain:${IP_PYHSS}"
+    networks:
+      lab:
+        ipv4_address: ${IP_SCSCF}
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      pyhss:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------- EPC
+  mme:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.open5gs
+    image: epdg-lab/open5gs:local
+    restart: unless-stopped
+    command: ["mmed"]
+    profiles: ["epc"]
+    environment:
+      OPEN5GS_COMPONENT: mme
+    volumes:
+      - ./runtime/open5gs/mme.yaml:/etc/open5gs/default/mme.yaml:ro
+      - ./runtime/freediameter/mme.conf:/etc/freeDiameter/mme.conf:ro
+      - open5gs-log:/var/log/open5gs
+    extra_hosts:
+      - "hss.localdomain:${IP_PYHSS}"
+    networks:
+      lab:
+        ipv4_address: ${IP_MME}
+    depends_on:
+      pyhss:
+        condition: service_healthy
+
+  sgwc:
+    image: epdg-lab/open5gs:local
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.open5gs
+    restart: unless-stopped
+    command: ["sgwcd"]
+    profiles: ["epc"]
+    environment:
+      OPEN5GS_COMPONENT: sgwc
+    volumes:
+      - ./runtime/open5gs/sgwc.yaml:/etc/open5gs/default/sgwc.yaml:ro
+      - open5gs-log:/var/log/open5gs
+    networks:
+      lab:
+        ipv4_address: ${IP_SGWC}
+    depends_on:
+      mme:
+        condition: service_started
+
+  sgwu:
+    image: epdg-lab/open5gs:local
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.open5gs
+    restart: unless-stopped
+    command: ["sgwud"]
+    profiles: ["epc"]
+    environment:
+      OPEN5GS_COMPONENT: sgwu
+    volumes:
+      - ./runtime/open5gs/sgwu.yaml:/etc/open5gs/default/sgwu.yaml:ro
+      - open5gs-log:/var/log/open5gs
+    networks:
+      lab:
+        ipv4_address: ${IP_SGWU}
+    depends_on:
+      sgwc:
+        condition: service_started
+
+  smf:
+    image: epdg-lab/open5gs:local
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.open5gs
+    restart: unless-stopped
+    command: ["smfd"]
+    profiles: ["epc"]
+    environment:
+      OPEN5GS_COMPONENT: smf
+    volumes:
+      - ./runtime/open5gs/smf.yaml:/etc/open5gs/default/smf.yaml:ro
+      - ./runtime/freediameter/smf.conf:/etc/freeDiameter/smf.conf:ro
+      - open5gs-log:/var/log/open5gs
+    extra_hosts:
+      - "hss.localdomain:${IP_PYHSS}"
+    networks:
+      lab:
+        ipv4_address: ${IP_SMF}
+    depends_on:
+      pyhss:
+        condition: service_healthy
+      sgwu:
+        condition: service_started
+
+  upf:
+    image: epdg-lab/open5gs:local
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.open5gs
+    restart: unless-stopped
+    command: ["upfd"]
+    profiles: ["epc"]
+    environment:
+      OPEN5GS_COMPONENT: upf
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ./runtime/open5gs/upf.yaml:/etc/open5gs/default/upf.yaml:ro
+      - open5gs-log:/var/log/open5gs
+    networks:
+      lab:
+        ipv4_address: ${IP_UPF}
+    depends_on:
+      smf:
+        condition: service_started
+
+  # Open5GS's own HSS and PCRF, only when open5gs.hss_backend is "open5gs".
+  o5gshss:
+    image: epdg-lab/open5gs:local
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.open5gs
+    restart: unless-stopped
+    command: ["hssd"]
+    profiles: ["open5gs-hss"]
+    environment:
+      OPEN5GS_COMPONENT: hss
+    volumes:
+      - ./runtime/open5gs/hss.yaml:/etc/open5gs/default/hss.yaml:ro
+      - ./runtime/freediameter/hss.conf:/etc/freeDiameter/hss.conf:ro
+      - open5gs-log:/var/log/open5gs
+    networks:
+      lab:
+        ipv4_address: ${IP_O5GSHSS}
+    depends_on:
+      mongo:
+        condition: service_started
+
+  o5gpcrf:
+    image: epdg-lab/open5gs:local
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.open5gs
+    restart: unless-stopped
+    command: ["pcrfd"]
+    profiles: ["open5gs-hss"]
+    environment:
+      OPEN5GS_COMPONENT: pcrf
+    volumes:
+      - ./runtime/open5gs/pcrf.yaml:/etc/open5gs/default/pcrf.yaml:ro
+      - ./runtime/freediameter/pcrf.conf:/etc/freeDiameter/pcrf.conf:ro
+      - open5gs-log:/var/log/open5gs
+    extra_hosts:
+      - "hss.localdomain:${IP_O5GSHSS}"
+    networks:
+      lab:
+        ipv4_address: ${IP_O5GPCRF}
+    depends_on:
+      o5gshss:
+        condition: service_started
+
+  # ------------------------------------------------------------------- ePDG
+  epdgd:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.epdgd
+    image: epdg-lab/epdgd:local
+    restart: unless-stopped
+    volumes:
+      - ./runtime/epdg/epdg.yaml:/etc/epdg/epdg.yaml:ro
+      # charon runs on the host, so its VICI socket is shared in read only.
+      - /run/charon.vici:/run/charon.vici
+    ports:
+      - "${EPDG_HTTP_PORT}:19090"
+      - "${EPDG_RADIUS_PORT}:18120/udp"
+    networks:
+      lab:
+        ipv4_address: ${IP_EPDG}
+    depends_on:
+      pyhss:
+        condition: service_healthy
+
+  # -------------------------------------------------------- base station
+  enb:
+    image: epdg-lab/srsran:local
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.srsran
+    restart: unless-stopped
+    profiles: ["enb"]
+    volumes:
+      - ./runtime/enb/enb.conf:/etc/srsran/enb.conf:ro
+    networks:
+      lab:
+        ipv4_address: ${IP_ENB}
+    depends_on:
+      mme:
+        condition: service_started

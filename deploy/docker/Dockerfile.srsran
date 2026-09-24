@@ -1,0 +1,38 @@
+# srsRAN 4G base station (srsenb).
+#
+# The eNB needs a radio. For a lab without hardware, srsRAN's ZMQ virtual radio
+# is the only option and is what deploy/lab.yaml defaults to. This image is only
+# built when the "enb" compose profile is enabled.
+FROM debian:bookworm-slim AS build
+
+ARG SRSRAN_VERSION=srsran_4g_23_11
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential cmake git ca-certificates \
+      libfftw3-dev libmbedtls-dev libboost-program-options-dev \
+      libconfig++-dev libsctp-dev libzmq3-dev libczmq-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+RUN git clone --depth 1 --branch "${SRSRAN_VERSION}" \
+      https://github.com/srsran/srsRAN_4G.git srsran
+
+WORKDIR /src/srsran/build
+RUN cmake ../ -DCMAKE_BUILD_TYPE=Release \
+ && make -j"$(nproc)" srsenb \
+ && make install
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      libfftw3-bin libmbedtls14 libboost-program-options1.74.0 \
+      libconfig++9v5 libsctp1 libzmq5 libczmq4 iproute2 \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /usr/local/bin/srsenb /usr/local/bin/srsenb
+COPY --from=build /usr/local/lib /usr/local/lib
+RUN ldconfig && mkdir -p /etc/srsran
+
+ENTRYPOINT ["/usr/local/bin/srsenb"]
+CMD ["--config", "/etc/srsran/enb.conf"]

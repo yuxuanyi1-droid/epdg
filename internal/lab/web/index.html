@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ePDG Lab · 配置台</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand__mark">ePDG&nbsp;LAB</span>
+      <span class="brand__sub">配置台 / labctl</span>
+    </div>
+    <div class="topbar__spacer"></div>
+    <div class="topbar__meta">
+      <span>节点 <b id="meta-node">—</b></span>
+      <span>PLMN <b id="meta-plmn">—</b></span>
+      <span>网桥 <b id="meta-subnet">—</b></span>
+    </div>
+    <div class="statusline">
+      <span class="pill pill--muted" id="status-render">读取中</span>
+      <button class="btn btn--ghost" id="btn-reload" type="button">重新载入</button>
+      <button class="btn" id="btn-render" type="button">生成配置</button>
+      <button class="btn btn--primary" id="btn-save" type="button">保存</button>
+    </div>
+  </header>
+
+  <nav class="rail" id="rail" aria-label="配置分区">
+    <div class="rail__heading">模块</div>
+  </nav>
+
+  <main class="workspace" id="workspace">
+    <p class="empty">正在读取 deploy/lab.yaml…</p>
+  </main>
+
+</div>
+
+<section class="module" id="console-module" style="margin:0 24px 32px">
+  <div class="module__head">
+    <span class="module__id">LOG</span>
+    <h2 class="module__title">操作记录</h2>
+    <span class="module__note">保存只写入 lab.yaml；点“生成配置”才会让容器读到改动</span>
+  </div>
+  <div class="module__body" style="padding:0">
+    <div class="console" id="console"></div>
+  </div>
+</section>
+
+<div class="toast" id="toast"></div>
+<script src="app.js"></script>
+</body>
+</html>

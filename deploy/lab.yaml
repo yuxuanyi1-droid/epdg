@@ -1,0 +1,122 @@
+# Managed by labctl. Edit through the configuration UI or by hand;
+# `labctl render` regenerates deploy/.env and deploy/runtime from this file.
+network:
+    name: epdg-lab
+    subnet: 10.99.0.0/24
+    nodes:
+        enb: 10.99.0.60
+        epdg: 10.99.0.50
+        icscf: 10.99.0.31
+        mariadb: 10.99.0.10
+        mme: 10.99.0.40
+        mongo: 10.99.0.12
+        o5gpcrf: 10.99.0.71
+        o5gshss: 10.99.0.70
+        pcscf: 10.99.0.30
+        pyhss: 10.99.0.20
+        redis: 10.99.0.11
+        scscf: 10.99.0.32
+        sgwc: 10.99.0.41
+        sgwu: 10.99.0.42
+        smf: 10.99.0.43
+        upf: 10.99.0.44
+    host_address: 10.99.0.1
+plmn:
+    mcc: "001"
+    mnc: "01"
+    mnc3: "001"
+credentials:
+    kamailio_db_password: heslo
+    radius_secret: pyhss-radius-secret
+    imsi: "001010000000001"
+    ki: 465B5CE8B199B49FAA5F0A2EE238A6BC
+    opc: 2e001f1df0a0bb769940a2c6342cf795
+epdg:
+    enabled: true
+    node_id: epdg.local
+    http:
+        listen: :19090
+    ipsec:
+        backend: vici
+        mode: passive
+        socket: /run/charon.vici
+        connection_name: epdg-ike
+        child_name: ue-default
+    aaa:
+        backend: pyhss_api
+        origin_host: epdg.localdomain
+        origin_realm: localdomain
+        destination_host: hss.localdomain
+        destination_realm: localdomain
+        eap_max_rounds: 4
+    radius:
+        backend: eap_aka
+        listen: 0.0.0.0:18120
+    protocol:
+        swu:
+            local_address: 0.0.0.0
+            ike_port: 500
+            natt_port: 4500
+        s2b:
+            backend: gtpv2
+            local_address: 0.0.0.0
+            apn: ims
+            timeout_seconds: 5
+    ue_pool:
+        subnet: 10.46.0.0/24
+        gateway: 10.46.0.1
+        range_start: 10.46.0.100
+        range_end: 10.46.0.200
+open5gs:
+    enabled: true
+    hss_backend: pyhss
+    mme:
+        mme_name: open5gs-mme0
+        mme_gid: 2
+        mme_code: 1
+        tac: 1
+        network_name_full: Open5GS
+        network_name_short: Next
+        integrity_order:
+            - EIA2
+            - EIA1
+            - EIA0
+        ciphering_order:
+            - EEA0
+            - EEA1
+            - EEA2
+    sgw:
+        gtpu_address: 10.99.0.42
+    ue_pool:
+        subnet: 10.45.0.0/16
+        gateway: 10.45.0.1
+        range_start: ""
+        range_end: ""
+    dns:
+        - 8.8.8.8
+        - 8.8.4.4
+    gtpc_port: 2123
+    pfcp_port: 8805
+enb:
+    enabled: false
+    device:
+        name: zmq
+        args: ""
+    enb_id: "0x19B"
+    mcc: "001"
+    mnc: "01"
+    tac: 1
+    s1c_bind_address: 10.99.0.60
+    gtp_bind_address: 10.99.0.60
+    n_prb: 50
+    dl_earfcn: 3350
+    tx_gain: 80
+    rx_gain: 40
+    cipher_algo_pref:
+        - EEA2
+        - EEA1
+        - EEA0
+    integ_algo_pref:
+        - EIA2
+        - EIA1
+        - EIA0

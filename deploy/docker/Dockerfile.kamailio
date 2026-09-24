@@ -1,0 +1,31 @@
+# A Kamailio CSCF. One image serves the P-CSCF, I-CSCF and S-CSCF; the role is
+# selected by the KAM_ROLE environment variable and the config directory mounted
+# at /etc/kamailio.
+FROM debian:bookworm-slim
+
+# The IMS modules are what make this an IMS node rather than a plain SIP proxy.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      kamailio \
+      kamailio-ims-modules \
+      kamailio-mysql-modules \
+      kamailio-extra-modules \
+      kamailio-json-modules \
+      kamailio-presence-modules \
+      kamailio-tls-modules \
+      kamailio-sctp-modules \
+      kamailio-utils-modules \
+      kamailio-websocket-modules \
+      kamailio-xml-modules \
+      mariadb-client \
+      curl \
+      iproute2 \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY deploy/docker/entrypoint-kamailio.sh /usr/local/bin/entrypoint-kamailio.sh
+RUN chmod +x /usr/local/bin/entrypoint-kamailio.sh
+
+# SIP signalling plus the Diameter acceptor each role uses.
+EXPOSE 5060/udp 5060/tcp 5061/udp 5062/udp 3869 3870 3871
+
+ENTRYPOINT ["/usr/local/bin/entrypoint-kamailio.sh"]

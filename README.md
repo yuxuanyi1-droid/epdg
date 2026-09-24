@@ -146,3 +146,23 @@ HSS 产生 SAA、P-CSCF 记录 200 OK，且 200 OK 经**严格 IMS IPsec**回程
 ### 尚未自动化覆盖
 
 无。上述三个联调脚本覆盖 SWu/EAP-AKA、S2b 与 IMS REGISTER 三条链路。
+
+## 容器化实验室与配置台
+
+除上面的原生联调外，`deploy/` 提供一套容器编排与一个配置台：
+
+```bash
+make -f deploy/Makefile lab-render   # 由 deploy/lab.yaml 生成 .env 与 runtime/
+make -f deploy/Makefile lab-up       # 启动容器
+make -f deploy/Makefile lab-verify   # 验证容器与信令
+make -f deploy/Makefile lab-ui       # 配置台 http://127.0.0.1:8088
+```
+
+- **唯一事实来源是 `deploy/lab.yaml`**：网桥与各容器地址、PLMN、订户密钥、
+  ePDG / Open5GS / 基站参数都在这里；`labctl render` 生成 `deploy/.env`
+  （compose 用）与 `deploy/runtime/`（容器挂载用）。
+- **配置台**（`labctl serve`）按域分成 Open5GS、基站（srsRAN eNB）、ePDG 三块，
+  外加网络与 PLMN 两节。保存只写 `lab.yaml`，"生成配置"才写 `runtime/`，
+  之后需要重启容器。校验在写入前完成，非法定义直接返回 422 与原因。
+- 详见 [deploy/README.md](deploy/README.md)，其中记录了容器内的一个已知限制
+  （S-CSCF 首次注册时崩溃，属 Kamailio 侧分支缺陷，非编排问题）。

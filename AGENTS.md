@@ -208,3 +208,51 @@ AKA vectors requires a source build:
 make -j4 && make install
 ```
 
+## Containerised lab (deploy/)
+
+`deploy/lab.yaml` is the single source of truth; `cmd/labctl` turns it into
+`deploy/.env` plus `deploy/runtime/`, and serves the configuration UI.
+
+- **Render is copy-and-substitute, not re-authoring.** The shipped configs under
+  `configs/` are copied and then rewritten by an explicit substitution table
+  (`internal/lab/render_services.go`). Every left-hand side is a string that
+  really exists in `configs/`, so a change there fails the render loudly instead
+  of silently emitting a wrong address. New parameters must be added to the
+  table anyway, or the UI would accept edits that never reach the containers -
+  that bit `open5gs.mme.*` once.
+- **Containers cannot share a static IP.** PyHSS is three processes that must
+  answer on one address, so they run in a single container with a small
+  supervisor in the entrypoint. Three compose services with the same
+  `ipv4_address` fail with "Address already in use".
+- **Kamailio needs `shm_size`.** `mlock_pages`/`shm_force_alloc` pre-fault the
+  whole shared memory pool; with the Docker default of 64 MB the registrar path
+  dies. The P-CSCF config also carries those two options, so the renderer turns
+  both off for containers.
+- **MariaDB init scripts only run on a fresh data directory.** They stay in
+  `/docker-entrypoint-initdb.d` for the schema and the CSCF users, which means
+  changing `credentials.kamailio_db_password` needs `docker compose down -v`.
+  The init SQL is generated from `lab.yaml` so the password is not duplicated.
+- **freeDiameter requires TLS material** even when every peer is `No_TLS`, so the
+  Open5GS image generates a self-signed pair at `/etc/open5gs/tls`.
+- **Open5GS's UPF needs `/dev/net/tun` and `NET_ADMIN`**; without the device it
+  will not start. SGW-U (`open5gs-sgwud`) is a pure PFCP/GTP-U user plane with no
+  TUN requirement and covers the S2b control-plane tests.
+- The compose file declares static IPs from `deploy/.env`, and `extra_hosts`
+  maps `hss.localdomain` to the PyHSS container so Kamailio's cdp and
+  freeDiameter can resolve it.
+
+### Known container-only limitation
+
+The S-CSCF segfaults on the **first** registration, inside the lab's modified
+branch in `configs/kamailio/scscf/kamailio.cfg`:
+
+```
+if (!impu_registered("location")) { xlog("L_ERR", "Not REGISTERED\n"); save("PRE_REG_SAR_REPLY", "location"); }
+```
+
+The crash happens before any database write (`scscf.impu` stays empty) and is not
+caused by shared memory, `mlock_pages`, `db_mode` or the database account. The
+same config passes 19/19 when run natively, so it is a Kamailio-side defect in
+this branch rather than an orchestration problem. `deploy/scripts/verify.sh`
+therefore asserts the chain up to the AKAv1-MD5 challenge and reports the final
+200 OK as a known limitation.

@@ -1,0 +1,51 @@
+# PyHSS: the HSS/AuC that supplies AKA vectors over REST and answers Cx over
+# Diameter. Three processes share this image (api, diameter, hss); see
+# deploy/docker/entrypoint-pyhss.sh.
+FROM debian:bookworm-slim
+
+# pysctp needs a compiler; the rest are PyHSS's runtime imports. The list is the
+# subset that the api, diameter and hss services actually import; the full
+# pyhss/requirements.txt pulls mysqlclient and pysnmp, which are not needed for
+# the SQLite setup this lab uses.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3 python3-venv python3-pip python3-dev \
+      gcc libsctp-dev libssl-dev curl sqlite3 \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/pyhss-venv
+ENV PATH="/opt/pyhss-venv/bin:${PATH}"
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir \
+      "flask==2.2.3" \
+      "flask-restx==1.1.0" \
+      "werkzeug==2.2.3" \
+      "requests" \
+      "sqlalchemy==2.0.44" \
+      "SQLAlchemy_Utils==0.41.1" \
+      "alembic" \
+      "pyyaml" \
+      "redis==5.0.0" \
+      "pydantic==2.8.2" \
+      "prometheus_client==0.16.0" \
+      "pycryptodome==3.17" \
+      "comp128==1.0.0" \
+      "pysctp==0.7.2" \
+      "tzlocal==4.3"
+
+COPY pyhss /pyhss
+# The Diameter logic loads its iFC template through a path relative to the
+# working directory (jinja2.FileSystemLoader("../")), and the packaged systemd
+# units run from <pyhss>/services. Running anywhere else makes the SAR handler
+# fail with TemplateNotFound and the S-CSCF then times out waiting for a SAA.
+WORKDIR /pyhss/services
+ENV PYTHONUNBUFFERED=1
+RUN mkdir -p /var/log/pyhss /var/lib/pyhss
+
+COPY deploy/docker/entrypoint-pyhss.sh /usr/local/bin/entrypoint-pyhss.sh
+COPY database/pyhss/hss.db /seed/hss.db
+RUN chmod +x /usr/local/bin/entrypoint-pyhss.sh
+
+# 8080 REST (api), 3868 Cx (diameter).
+EXPOSE 8080 3868
+ENTRYPOINT ["/usr/local/bin/entrypoint-pyhss.sh"]

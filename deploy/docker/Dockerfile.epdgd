@@ -1,0 +1,22 @@
+# The ePDG control plane: EAP-AKA over RADIUS, SWm towards the HSS and the S2b
+# control plane towards the PGW-C.
+FROM golang:1.24-bookworm AS build
+WORKDIR /src
+# Cache the module download separately from the source.
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/epdgd ./cmd/epdgd
+
+FROM debian:bookworm-slim
+# curl is used by the readiness endpoint and by container healthchecks.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/epdgd /usr/local/bin/epdgd
+# VICI needs to reach the charon socket that the host shares in.
+VOLUME ["/run"]
+EXPOSE 19090 18120/udp
+ENTRYPOINT ["/usr/local/bin/epdgd"]
+CMD ["-config", "/etc/epdg/epdg.yaml"]
