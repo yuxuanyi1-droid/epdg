@@ -30,29 +30,58 @@ const (
 
 // Request describes the S2b session to establish.
 type Request struct {
-	IMSI      string
-	MSISDN    string
-	APN       string
-	MCC       string
-	MNC       string
-	LocalIP   string
+	IMSI   string
+	MSISDN string
+	APN    string
+	MCC    string
+	MNC    string
+	// LocalIP is the ePDG address advertised in both F-TEIDs.
+	LocalIP string
+	// LocalTEID is the ePDG S2b C-plane (GTP-C) TEID.
 	LocalTEID uint32
-	PDNType   uint8
-	EBI       uint8
-	QCI       uint8
-	AMBRUp    uint32
-	AMBRDown  uint32
-	RATType   uint8
+	// LocalUTEID is the ePDG S2b U-plane (GTP-U) TEID. TS 29.274 requires the
+	// ePDG to advertise it in the bearer context so the PGW-U can build the
+	// downlink tunnel.
+	LocalUTEID uint32
+	// PeerTEID is the peer's C-plane TEID, taken from the Create Session
+	// Response. It is the destination TEID of every later transaction of the
+	// same session, such as Delete Session, and the peer resolves the session
+	// from the GTPv2 header TEID (3GPP TS 29.274 section 7.2.9).
+	PeerTEID uint32
+	PDNType  uint8
+	EBI      uint8
+	QCI      uint8
+	// PriorityLevel is the ARP priority level carried in the bearer QoS.
+	PriorityLevel uint8
+	AMBRUp        uint32
+	AMBRDown      uint32
+	RATType       uint8
+}
+
+// BearerResult carries the per-bearer values of a Create Session Response.
+type BearerResult struct {
+	EBI uint8
+	// PGWUTEID and PGWUAddress are the PGW-U S2b U-plane endpoint, which the
+	// ePDG needs to program its own GTP-U side.
+	PGWUTEID    uint32
+	PGWUAddress string
+	// PGWUTeidInterfaceType records which interface type the peer used, so the
+	// caller can tell an S2b reply from an S5/S8 one.
+	PGWUTeidInterfaceType uint8
 }
 
 // Result carries the values extracted from a Create Session Response.
 type Result struct {
-	Cause        uint8
-	PGWTEID      uint32
+	Cause uint8
+	// PGWCTEID and PGWAddress identify the peer's C-plane endpoint.
+	PGWCTEID     uint32
 	PGWAddress   string
+	PGWCTEIDType uint8
 	PDNAddress   string
 	PDNType      uint8
-	RawCauseText string
+	Bearers      []BearerResult
+	Recovery     uint8
+	HasRecovery  bool
 }
 
 // Client is a transaction oriented S2b GTPv2-C client.
@@ -202,9 +231,14 @@ func (c *Client) Echo(ctx context.Context) error {
 }
 
 // buildCreateSessionIEs assembles the information elements of an S2b Create
-// Session Request. Defaults are applied for the optional fields so callers only
-// have to supply the subscriber identity and the local F-TEID.
-func buildCreateSessionIEs(req Request) []*ie.IE {
+// Session Request as required by 3GPP TS 29.274 section 7.2.1 and as accepted
+// by a real PGW-C. Defaults are applied for optional fields.
+//
+// Note that a WLAN (S2b) session must carry the ePDG S2b U-plane F-TEID inside
+// the bearer context, otherwise the PGW rejects the request with
+// "No S2b ePDG GTP-U TEID" (mandatory IE missing). The reference composition is
+// Open5GS's own ePDG test harness, tests/non3gpp/s2b-build.c.
+func buildCreateSessionIEs(req Request) ([]*ie.IE, error) {
 	pdnType := req.PDNType
 	if pdnType == 0 {
 		pdnType = PDNTypeIPv4
@@ -221,33 +255,67 @@ func buildCreateSessionIEs(req Request) []*ie.IE {
 	if qci == 0 {
 		qci = 9
 	}
+	priority := req.PriorityLevel
+	if priority == 0 {
+		priority = 1
+	}
 	ambrUp := req.AMBRUp
-	ambrDown := req.AMBRDown
 	if ambrUp == 0 {
 		ambrUp = 100000
 	}
+	ambrDown := req.AMBRDown
 	if ambrDown == 0 {
 		ambrDown = 100000
 	}
+
+	paa, err := newPDNAddressAllocationRequest(pdnType)
+	if err != nil {
+		return nil, err
+	}
+
+	// Bearer Context: EBI, the ePDG S2b-U F-TEID (instance 5) and the QoS.
+	bearerContext := ie.NewBearerContext(
+		ie.NewEPSBearerID(ebi),
+		ie.NewFullyQualifiedTEID(gtpv2.IFTypeS2bUePDGGTPU, req.LocalUTEID, req.LocalIP, "").WithInstance(5),
+		ie.NewBearerQoS(priority, 0, 0, qci, uint64(ambrUp), uint64(ambrDown), 0, 0),
+	)
 
 	ies := []*ie.IE{
 		ie.NewIMSI(req.IMSI),
 		ie.NewServingNetwork(req.MCC, req.MNC),
 		ie.NewRATType(ratType),
+		// Sender F-TEID for the control plane: the ePDG S2b C-plane endpoint.
 		ie.NewFullyQualifiedTEID(gtpv2.IFTypeS2bePDGGTPC, req.LocalTEID, req.LocalIP, ""),
 		ie.NewAccessPointName(req.APN),
 		ie.NewSelectionMode(gtpv2.SelectionModeMSOrNetworkProvidedAPNSubscribedVerified),
-		ie.NewPDNType(pdnType),
+		paa,
 		ie.NewAggregateMaximumBitRate(ambrUp, ambrDown),
-		ie.NewBearerContext(
-			ie.NewEPSBearerID(ebi),
-			ie.NewBearerQoS(0, 0, 0, qci, uint64(ambrUp), uint64(ambrDown), 0, 0),
-		),
+		bearerContext,
+		// Recovery is not mandatory but every reference implementation sends it
+		// and the peer echoes its own value back.
+		ie.NewRecovery(0),
 	}
 	if req.MSISDN != "" {
 		ies = append(ies, ie.NewMSISDN(req.MSISDN))
 	}
-	return append(ies, ueTimeZone())
+	return append(ies, ueTimeZone()), nil
+}
+
+// newPDNAddressAllocationRequest builds a PDN Address Allocation IE that carries
+// only the requested PDN type, which asks the PGW to allocate an address
+// (TS 29.274 section 8.14).
+func newPDNAddressAllocationRequest(pdnType uint8) (*ie.IE, error) {
+	switch pdnType {
+	case PDNTypeIPv4, PDNTypeIPv6, PDNTypeIPv4v6:
+	default:
+		return nil, fmt.Errorf("gtpv2: unsupported PDN type %d", pdnType)
+	}
+	fields := ie.NewPDNAddressAllocationFields(pdnType, nil, nil, 0)
+	payload, err := fields.Marshal()
+	if err != nil {
+		return nil, fmt.Errorf("gtpv2: cannot encode the PDN Address Allocation: %w", err)
+	}
+	return ie.New(ie.PDNAddressAllocation, 0x00, payload), nil
 }
 
 // CreateSession establishes an S2b session (3GPP TS 29.274 section 7.2.1).
@@ -261,11 +329,18 @@ func (c *Client) CreateSession(ctx context.Context, req Request) (*Result, error
 	if req.LocalTEID == 0 {
 		return nil, errors.New("gtpv2: a local C-plane TEID is required")
 	}
+	if req.LocalUTEID == 0 {
+		return nil, errors.New("gtpv2: a local U-plane TEID is required for the S2b bearer")
+	}
 	if req.LocalIP == "" {
 		return nil, errors.New("gtpv2: a local IP address is required for the S2b F-TEID")
 	}
 
-	request := message.NewCreateSessionRequest(0, c.nextSequence(), buildCreateSessionIEs(req)...)
+	ies, err := buildCreateSessionIEs(req)
+	if err != nil {
+		return nil, err
+	}
+	request := message.NewCreateSessionRequest(0, c.nextSequence(), ies...)
 	response, err := c.roundTrip(ctx, request, message.MsgTypeCreateSessionResponse)
 	if err != nil {
 		return nil, err
@@ -274,6 +349,10 @@ func (c *Client) CreateSession(ctx context.Context, req Request) (*Result, error
 	if !ok {
 		return nil, fmt.Errorf("gtpv2: unexpected create session response type %T", response)
 	}
+	return parseCreateSessionResponse(csr, c.log)
+}
+
+func parseCreateSessionResponse(csr *message.CreateSessionResponse, log *slog.Logger) (*Result, error) {
 	if csr.Cause == nil {
 		return nil, errors.New("gtpv2: Create Session Response lacks the mandatory Cause IE")
 	}
@@ -282,33 +361,97 @@ func (c *Client) CreateSession(ctx context.Context, req Request) (*Result, error
 		return nil, fmt.Errorf("gtpv2: cannot decode Cause IE: %w", err)
 	}
 	result := &Result{Cause: cause}
+
 	if csr.PGWS5S8FTEIDC != nil {
-		if fields, err := ie.ParseFullyQualifiedTEIDFields(csr.PGWS5S8FTEIDC.Payload); err == nil {
-			result.PGWTEID = fields.TEIDGREKey
-			if fields.IPv4Address != nil {
-				result.PGWAddress = fields.IPv4Address.String()
-			}
+		fields, err := ie.ParseFullyQualifiedTEIDFields(csr.PGWS5S8FTEIDC.Payload)
+		if err != nil {
+			return nil, fmt.Errorf("gtpv2: cannot decode the PGW C-plane F-TEID: %w", err)
+		}
+		result.PGWCTEID = fields.TEIDGREKey
+		result.PGWCTEIDType = fields.InterfaceType
+		if fields.IPv4Address != nil {
+			result.PGWAddress = fields.IPv4Address.String()
 		}
 	}
 	if csr.PAA != nil {
-		if fields, err := ie.ParsePDNAddressAllocationFields(csr.PAA.Payload); err == nil {
-			result.PDNType = fields.PDNType
-			if fields.IPv4Address != nil {
-				result.PDNAddress = fields.IPv4Address.String()
-			} else if fields.IPv6Address != nil {
-				result.PDNAddress = fmt.Sprintf("%s/%d", fields.IPv6Address.String(), fields.IPv6PrefixLength)
-			}
+		fields, err := ie.ParsePDNAddressAllocationFields(csr.PAA.Payload)
+		if err != nil {
+			return nil, fmt.Errorf("gtpv2: cannot decode the PDN Address Allocation: %w", err)
+		}
+		result.PDNType = fields.PDNType
+		// An all-zero address means no address was allocated, which is not the
+		// same as the literal address 0.0.0.0.
+		switch {
+		case fields.IPv4Address != nil && !fields.IPv4Address.IsUnspecified():
+			result.PDNAddress = fields.IPv4Address.String()
+		case fields.IPv6Address != nil && !fields.IPv6Address.IsUnspecified():
+			result.PDNAddress = fmt.Sprintf("%s/%d", fields.IPv6Address.String(), fields.IPv6PrefixLength)
 		}
 	}
-	c.log.Info("gtpv2: create session response",
-		"peer", c.peer.String(), "cause", cause, "pgw_teid", result.PGWTEID, "pdn_address", result.PDNAddress)
+	if csr.Recovery != nil {
+		if v, err := csr.Recovery.Recovery(); err == nil {
+			result.Recovery = v
+			result.HasRecovery = true
+		}
+	}
+	for _, bc := range csr.BearerContextsCreated {
+		bearer, err := parseBearerContext(bc)
+		if err != nil {
+			return nil, err
+		}
+		result.Bearers = append(result.Bearers, *bearer)
+	}
+	if log != nil {
+		log.Info("gtpv2: create session response",
+			"cause", cause,
+			"pgw_c_teid", result.PGWCTEID, "pgw_address", result.PGWAddress,
+			"pdn_address", result.PDNAddress, "bearers", len(result.Bearers))
+	}
 	return result, nil
 }
 
-// DeleteSession tears down an S2b session (3GPP TS 29.274 section 7.2.9).
+// parseBearerContext walks the grouped information elements of a bearer context
+// and extracts the EBI and the peer's U-plane F-TEID.
+func parseBearerContext(bc *ie.IE) (*BearerResult, error) {
+	if bc == nil {
+		return nil, errors.New("gtpv2: nil bearer context")
+	}
+	out := &BearerResult{}
+	for _, child := range bc.ChildIEs {
+		switch child.Type {
+		case ie.EPSBearerID:
+			if ebi, err := child.EPSBearerID(); err == nil {
+				out.EBI = ebi
+			}
+		case ie.FullyQualifiedTEID:
+			fields, err := ie.ParseFullyQualifiedTEIDFields(child.Payload)
+			if err != nil {
+				continue
+			}
+			// The U-plane F-TEID is the only one in a bearer context; record it
+			// together with its interface type so the caller can verify whether
+			// the peer answered on S2b or on S5/S8.
+			if out.PGWUTEID == 0 {
+				out.PGWUTEID = fields.TEIDGREKey
+				out.PGWUTeidInterfaceType = fields.InterfaceType
+				if fields.IPv4Address != nil {
+					out.PGWUAddress = fields.IPv4Address.String()
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
+// DeleteSession tears down an S2b session (3GPP TS 29.274 section 7.2.9). The
+// request is addressed to the peer C-plane TEID obtained from the Create
+// Session Response, because that is how the peer identifies the session.
 func (c *Client) DeleteSession(ctx context.Context, req Request) error {
-	if req.IMSI == "" || req.EBI == 0 {
-		return errors.New("gtpv2: imsi and ebi are required to delete a session")
+	if req.EBI == 0 {
+		return errors.New("gtpv2: an EBI is required to delete a session")
+	}
+	if req.PeerTEID == 0 {
+		return errors.New("gtpv2: the peer C-plane TEID is required to delete a session")
 	}
 	ies := []*ie.IE{
 		ie.NewEPSBearerID(req.EBI),
@@ -316,7 +459,7 @@ func (c *Client) DeleteSession(ctx context.Context, req Request) error {
 	if req.MCC != "" && req.MNC != "" {
 		ies = append(ies, ueTimeZone(), ie.NewServingNetwork(req.MCC, req.MNC))
 	}
-	request := message.NewDeleteSessionRequest(0, c.nextSequence(), ies...)
+	request := message.NewDeleteSessionRequest(req.PeerTEID, c.nextSequence(), ies...)
 	response, err := c.roundTrip(ctx, request, message.MsgTypeDeleteSessionResponse)
 	if err != nil {
 		return err

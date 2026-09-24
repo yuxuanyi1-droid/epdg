@@ -1,5 +1,6 @@
 # Go build output
 /epdgd
+/diampeer
 *.test
 
 # Python bytecode

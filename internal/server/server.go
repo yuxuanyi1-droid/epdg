@@ -16,6 +16,7 @@ import (
 	"epdg/internal/aaa"
 	"epdg/internal/compliance"
 	"epdg/internal/config"
+	"epdg/internal/gtpv2"
 	"epdg/internal/hss"
 	"epdg/internal/ipsec"
 	"epdg/internal/s2b"
@@ -150,7 +151,9 @@ func (a *App) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := a.s2b.Create(ctx, req.UEID, req.IMSI, req.APN); err != nil {
+	pdnAddress := ""
+	s2bResult, err := a.s2b.Create(ctx, req.UEID, req.IMSI, req.APN)
+	if err != nil {
 		if status == session.StatusUp {
 			if cleanupErr := a.ipsec.Terminate(ctx, req.UEID); cleanupErr != nil {
 				a.log.Warn("create: rollback of the CHILD_SA failed", "ue_id", req.UEID, "error", cleanupErr)
@@ -160,15 +163,42 @@ func (a *App) handleCreate(w http.ResponseWriter, r *http.Request) {
 		}
 		a.log.Warn("create: S2b signalling failed while waiting for the UE", "ue_id", req.UEID, "error", err)
 	}
+	if s2bResult != nil {
+		pdnAddress = s2bResult.PDNAddress
+	}
 
 	stored := a.sessions.Upsert(&session.Session{
-		UEID:   req.UEID,
-		IMSI:   req.IMSI,
-		APN:    req.APN,
-		Status: status,
+		UEID:      req.UEID,
+		IMSI:      req.IMSI,
+		APN:       req.APN,
+		Status:    status,
+		PDNType:   pdnTypeName(pdnAddress, s2bResult),
+		UEAddress: pdnAddress,
 	})
-	a.log.Info("session created", "ue_id", req.UEID, "imsi", req.IMSI, "status", status)
+	a.log.Info("session created",
+		"ue_id", req.UEID, "imsi", req.IMSI, "status", status, "ue_address", pdnAddress)
 	a.writeJSON(w, httpStatus, stored)
+}
+
+// pdnTypeName renders the PDN type reported by the peer, or an empty string when
+// no S2b session was established.
+func pdnTypeName(address string, result *gtpv2.Result) string {
+	if result == nil {
+		return ""
+	}
+	if address == "" {
+		return ""
+	}
+	switch result.PDNType {
+	case gtpv2.PDNTypeIPv4:
+		return "ipv4"
+	case gtpv2.PDNTypeIPv6:
+		return "ipv6"
+	case gtpv2.PDNTypeIPv4v6:
+		return "ipv4v6"
+	default:
+		return ""
+	}
 }
 
 type deleteRequest struct {
