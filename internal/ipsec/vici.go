@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/strongswan/govici/vici"
@@ -86,29 +87,44 @@ func (b *ViciBackend) Status(ctx context.Context) (string, error) {
 	return version, nil
 }
 
-// Load loads every connection defined in swanctl.conf into charon
-// (the load-all VICI command).
+// Load loads the swanctl configuration into charon.
+//
+// Two things about this are easy to get wrong:
+//
+//   - There is no "load-all" VICI command. charon answers one with
+//     pktCmdUnkown, which govici reports as "unexpected response type: 2";
+//     swanctl's --load-all issues the four commands below instead.
+//   - They must be plain requests, not streaming ones. Registering a
+//     "control-log" subscription first fails against this charon, and the
+//     failure surfaces as the same "unexpected response type: 2" message, which
+//     makes it look like the command name is wrong when it is the subscription.
 func (b *ViciBackend) Load(ctx context.Context) error {
+	commands := []string{"load-creds", "load-authorities", "load-pools", "load-conns"}
 	return b.withSession(ctx, func(callCtx context.Context, session *vici.Session) error {
-		if _, err := session.Call(callCtx, "load-all", nil); err != nil {
-			return fmt.Errorf("ipsec: load-all failed: %w", err)
+		for _, cmd := range commands {
+			if _, err := session.Call(callCtx, cmd, nil); err != nil {
+				return fmt.Errorf("ipsec: %s failed: %w", cmd, err)
+			}
 		}
-		b.log.Debug("loaded swanctl configuration")
+		b.log.Debug("loaded the swanctl configuration")
 		return nil
 	})
 }
 
-// Initiate starts the CHILD_SA for a UE. In passive mode, which is the SWu
-// model, it only makes sure the connection is loaded and reports ErrPending.
+// Initiate starts the CHILD_SA for a UE.
+//
+// On SWu the UE is always the IKEv2 initiator, so the ePDG runs in passive mode:
+// the connection already exists in charon (loaded from swanctl.conf by swanctl or
+// by charon itself) and the correct answer is to report ErrPending and wait for
+// the UE. No VICI call is made here on purpose: reloading the configuration is
+// charon's lifecycle, not the ePDG's, and a failure to do so must not stop a
+// session from being accepted.
 func (b *ViciBackend) Initiate(ctx context.Context, ueID string) error {
 	if ueID == "" {
 		return fmt.Errorf("ipsec: ue_id is required")
 	}
 	child := ChildName(config.IPSec{ChildName: b.childName, ChildPrefix: b.childPrefix}, ueID)
 	if b.mode == "passive" {
-		if err := b.Load(ctx); err != nil {
-			return err
-		}
 		return fmt.Errorf("%w (child %s)", ErrPending, child)
 	}
 
@@ -133,6 +149,11 @@ func (b *ViciBackend) Initiate(ctx context.Context, ueID string) error {
 }
 
 // Terminate tears down the CHILD_SA for a UE.
+//
+// It is idempotent: a session that is still pending has no CHILD_SA yet, because
+// the UE has not brought IKEv2 up, and charon then answers "no matching SAs to
+// terminate found". There is nothing to tear down in that case, so it is not an
+// error; reporting one would leave the S2b session unreleased.
 func (b *ViciBackend) Terminate(ctx context.Context, ueID string) error {
 	if ueID == "" {
 		return fmt.Errorf("ipsec: ue_id is required")
@@ -148,11 +169,24 @@ func (b *ViciBackend) Terminate(ctx context.Context, ueID string) error {
 		}
 		for _, err := range session.CallStreaming(callCtx, "terminate", "control-log", in) {
 			if err != nil {
+				if isNoSuchSA(err) {
+					b.log.Debug("nothing to terminate, the CHILD_SA was never established", "child", child)
+					return nil
+				}
 				return fmt.Errorf("ipsec: terminate %s failed: %w", child, err)
 			}
 		}
 		return nil
 	})
+}
+
+// isNoSuchSA reports whether charon's error means the requested SA is absent.
+func isNoSuchSA(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no matching sa") || strings.Contains(msg, "no child sa")
 }
 
 // SAInfo summarises one IKE_SA and its CHILD_SAs as reported by list-sas.

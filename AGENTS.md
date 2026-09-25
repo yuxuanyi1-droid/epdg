@@ -241,18 +241,93 @@ make -j4 && make install
   maps `hss.localdomain` to the PyHSS container so Kamailio's cdp and
   freeDiameter can resolve it.
 
-### Known container-only limitation
+### Container Kamailio version (was misdiagnosed as a config bug)
 
-The S-CSCF segfaults on the **first** registration, inside the lab's modified
-branch in `configs/kamailio/scscf/kamailio.cfg`:
+The containerised S-CSCF used to segfault on the first registration, inside the
+lab's modified branch in `configs/kamailio/scscf/kamailio.cfg`:
 
 ```
-if (!impu_registered("location")) { xlog("L_ERR", "Not REGISTERED\n"); save("PRE_REG_SAR_REPLY", "location"); }
+if (!impu_registered("location")) { xlog("L_ERR", "Not REGISTERED"); save("PRE_REG_SAR_REPLY", "location"); }
 ```
 
-The crash happens before any database write (`scscf.impu` stays empty) and is not
-caused by shared memory, `mlock_pages`, `db_mode` or the database account. The
-same config passes 19/19 when run natively, so it is a Kamailio-side defect in
-this branch rather than an orchestration problem. `deploy/scripts/verify.sh`
-therefore asserts the chain up to the AKAv1-MD5 challenge and reports the final
-200 OK as a known limitation.
+From the UE this looked like a protocol failure - the 401 challenge arrived and
+then a 504 came back instead of a 200 OK - and since nothing reached the HSS it
+read as a Cx problem. Neither was true.
+
+The cause was the base image: `debian:bookworm-slim` ships **Kamailio 5.6.3**,
+whose `ims_registrar_scscf` crashes in `save()` before sending any Diameter
+request, while the configs were written and validated against the **6.0.1** in
+trixie. Building the image on `debian:trixie-slim` fixes it, and the containerised
+REGISTER now completes 401 -> 200 OK (17/17 in `deploy/scripts/verify.sh`,
+including an explicit assertion that no SIGSEGV was logged).
+
+Ruled out along the way, so they do not need retesting: shared memory
+(`shm_size`), `mlock_pages`/`shm_force_alloc`, `ims_usrloc_scscf.db_mode` and the
+database account. The `#!define URI` self-name *was* a separate real bug: the
+renderer rewrote `listen=` but left the node's own URI on 127.0.0.1, so
+`ims_auth.name` and `registrar.scscf_name` described an address the node did not
+have.
+
+### Building the images
+
+The Open5GS image is built from source and needs the full freeDiameter toolchain;
+`flex` and `bison` are easy to miss and fail the build at
+`subprojects/freeDiameter/meson.build`.
+
+### Container EPC gotchas
+
+Found while making an S2b session complete inside the container lab. Each one
+presents as a protocol rejection from the peer, so they are worth knowing:
+
+- **PyHSS has no S6b.** Its Diameter applications are Cx (16777216), Sh
+  (16777217), Rx (16777236), Gx (16777238), S6a (16777251), EIR (16777252) and
+  16777291. An S2b (WLAN) session makes Open5GS's PGW-C send **both** a Gx CCR
+  and an S6b AAR, and it refuses the session outright (cause 100) if either has
+  no answering peer. The repository's `test/integration/diampeer` fills both
+  roles; the lab runs it as the `aaa` service. Without it, S2b cannot complete
+  against PyHSS no matter how correct the ePDG's request is.
+- **freeDiameter's `ConnectPeer` name must equal the peer's Origin-Host.** Naming
+  the peer `hss.localdomain` while it identifies as `aaa.localdomain` makes
+  freeDiameter reject the CEA with `save_remote_CE_info: Invalid argument`, and
+  the peer never reaches OPEN. The symptom is "No Gx Diameter Peer" from the SMF,
+  which points at the wrong layer entirely.
+- **The PGW-C needs a PFCP peer.** With `upf` in its own profile (it needs
+  `/dev/net/tun`), the SMF has nobody to establish the session with. Pointing its
+  PFCP client at the SGW-U, which is a pure PFCP/GTP-U function, fixes it.
+- **freeDiameter validates its own TLS certificate against its DiameterIdentity**,
+  so one certificate has to carry a subjectAltName for every identity in the lab
+  (mme/smf/hss/pcrf.localdomain).
+- **Open5GS's runtime image needs more than the binaries**: `libogs*`, `libfd*`,
+  the freeDiameter `.fdx` extensions and `libprom.so` (which lands in the
+  multiarch lib directory). Missing any of them makes every daemon exit 127 with
+  "error while loading shared libraries".
+
+### VICI details that cost time
+
+- **There is no `load-all` VICI command.** charon answers it with pktCmdUnkown
+  (packet type 2), which govici reports as "unexpected response type: 2".
+  swanctl's `--load-all` issues `load-creds`, `load-authorities`, `load-pools`
+  and `load-conns` separately.
+- **Do not subscribe to an event for those commands.** Adding a `control-log`
+  subscription before them fails against this charon, and the failure surfaces as
+  the same "unexpected response type: 2", which makes it look like the command
+  name is wrong when it is the subscription.
+- The ePDG therefore does **not** reload charon's configuration while accepting a
+  session: in passive mode the connection already exists in charon, and loading
+  the configuration is charon's own lifecycle. `Load()` is attempted once at
+  start up and only logged if it fails.
+- **CHILD_SA termination has to be idempotent.** A pending session has no
+  CHILD_SA yet, and charon answers "no matching SAs to terminate found"; treating
+  that as an error stops the S2b session from being released.
+
+### Host strongSwan
+
+- `strongswan-charon` (not `charon-systemd`) provides the standalone
+  `/usr/lib/ipsec/charon`. The systemd variant exits silently without the notify
+  socket and leaves no VICI socket.
+- `kernel-libipsec` aborts charon when `/dev/net/tun` is absent, so the generated
+  `strongswan.conf` sets `load = no` for it and keeps `kernel-netlink`.
+- The VICI socket lives in `/run/epdg-lab/`, a directory shared with the ePDG
+  container. Binding `/run/charon.vici` directly does not work: a bind mount
+  whose source does not exist yet is created as a *directory* by the container
+  runtime, and charon then cannot create its socket there.

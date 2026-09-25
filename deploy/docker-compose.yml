@@ -276,7 +276,11 @@ services:
       dockerfile: deploy/docker/Dockerfile.open5gs
     restart: unless-stopped
     command: ["upfd"]
-    profiles: ["epc"]
+    # The UPF is the 5G user plane and needs /dev/net/tun. The 4G path
+    # (MME -> SGW-U -> SMF/PGW with its own GTP-U) does not, so it lives in its
+    # own profile: including it in `epc` would fail the whole profile on hosts
+    # without the TUN device.
+    profiles: ["upf"]
     environment:
       OPEN5GS_COMPONENT: upf
     cap_add:
@@ -292,6 +296,29 @@ services:
     depends_on:
       smf:
         condition: service_started
+
+  # The Gx/S6b Diameter test peer. Open5GS refuses an S2b session unless both
+  # applications have an answering peer, and PyHSS implements neither S6b nor a
+  # Gx policy response. See deploy/README.md.
+  aaa:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.diampeer
+    image: epdg-lab/diampeer:local
+    restart: unless-stopped
+    profiles: ["epc"]
+    command:
+      - "-listen"
+      - "${IP_AAA}:3868"
+      - "-origin-host"
+      - "aaa.localdomain"
+      - "-origin-realm"
+      - "localdomain"
+      - "-host-ip"
+      - "${IP_AAA}"
+    networks:
+      lab:
+        ipv4_address: ${IP_AAA}
 
   # Open5GS's own HSS and PCRF, only when open5gs.hss_backend is "open5gs".
   o5gshss:
@@ -348,7 +375,7 @@ services:
     volumes:
       - ./runtime/epdg/epdg.yaml:/etc/epdg/epdg.yaml:ro
       # charon runs on the host, so its VICI socket is shared in read only.
-      - /run/charon.vici:/run/charon.vici
+      - /run/epdg-lab:/run/epdg-lab
     ports:
       - "${EPDG_HTTP_PORT}:19090"
       - "${EPDG_RADIUS_PORT}:18120/udp"

@@ -4,6 +4,10 @@ network:
     name: epdg-lab
     subnet: 10.99.0.0/24
     nodes:
+        # The Gx/S6b Diameter peer. Open5GS's PGW-C requires both before it will
+        # allocate an S2b session; PyHSS implements neither S6b nor a Gx policy
+        # response, so the repository's test peer fills those two roles.
+        aaa: 10.99.0.13
         enb: 10.99.0.60
         epdg: 10.99.0.50
         icscf: 10.99.0.31
@@ -39,7 +43,7 @@ epdg:
     ipsec:
         backend: vici
         mode: passive
-        socket: /run/charon.vici
+        socket: /run/epdg-lab/charon.vici
         connection_name: epdg-ike
         child_name: ue-default
     aaa:

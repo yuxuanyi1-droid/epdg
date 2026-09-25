@@ -10,6 +10,16 @@ import (
 	"text/template"
 )
 
+// ViciDir is the directory strongSwan's VICI socket lives in, shared between the
+// host charon and the ePDG container. It is a directory rather than
+// /run/charon.vici because a bind mount whose source path does not exist yet is
+// created as a directory by the container runtime, which then stops charon from
+// creating its socket there.
+const ViciDir = "/run/epdg-lab"
+
+// ViciSocketPath is the path of charon's VICI socket.
+const ViciSocketPath = ViciDir + "/charon.vici"
+
 // Renderer turns deploy/lab.yaml into the configuration each container mounts.
 //
 // The configs under configs/ are the authoritative source: they are copied and

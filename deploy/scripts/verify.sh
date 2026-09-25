@@ -23,7 +23,6 @@ PYHSS_PYTHON="${PYHSS_PYTHON:-python3}"
 PASS=0
 FAIL=0
 declare -a RESULTS=()
-declare -a LIMITATIONS=()
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()  { PASS=$((PASS + 1)); RESULTS+=("PASS  $1"); printf '\033[1;32mPASS\033[0m %s\n' "$1"; }
@@ -131,19 +130,20 @@ check_register() {
 	if [ "${rc}" -eq 0 ]; then
 		ok "REGISTER completed 401 -> 200 OK against the P-CSCF container"
 	else
-		# A container-only limitation, reported separately from orchestration
-		# faults: see the note in deploy/README.md.
-		known_limitation "the containerised S-CSCF crashes on the first registration, so the final 200 OK is not sent (see below)"
+		bad "REGISTER did not complete; see ${log}"
+		grep -E "^(FATAL|FAIL)" "${log}" | tail -3 | sed 's/^/     /'
 	fi
-}
 
-# known_limitation records something that is understood and not an
-# orchestration fault. It is printed prominently but does not fail the run; the
-# evidence is in the artefacts.
-declare -a LIMITATIONS=()
-known_limitation() {
-	LIMITATIONS+=("$1")
-	printf '\033[1;33mKNOWN\033[0m %s\n' "$1"
+	# A crash inside the registrar is worth calling out on its own: from the UE
+	# side it looks like a protocol failure, but it is a Kamailio defect, and the
+	# version is what decides it (5.6.x segfaults, 6.0.x does not).
+	local crashes
+	crashes="$(${COMPOSE} logs scscf 2>&1 | grep -c 'signal 11' || true)"
+	if [ "${crashes}" -eq 0 ]; then
+		ok "the S-CSCF did not crash during the exchange"
+	else
+		bad "the S-CSCF logged ${crashes} SIGSEGV(s); check the Kamailio version in the image"
+	fi
 }
 
 summary() {
@@ -152,11 +152,6 @@ summary() {
 	printf '%s\n' "${RESULTS[@]}"
 	echo "---------------------------------------------------------------"
 	printf 'passed: %d   failed: %d\n' "${PASS}" "${FAIL}"
-	if [ "${#LIMITATIONS[@]}" -gt 0 ]; then
-		echo
-		echo "Known limitations (understood, not orchestration faults):"
-		printf '  - %s\n' "${LIMITATIONS[@]}"
-	fi
 	echo "==============================================================="
 	[ "${FAIL}" -eq 0 ]
 }

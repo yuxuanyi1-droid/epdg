@@ -115,26 +115,71 @@ charon {
 }
 ```
 
-## 已知限制
+## 镜像基础版本很关键
 
-**容器内的 S-CSCF 在首次注册时会崩溃（SIGSEGV）。**
+`Dockerfile.kamailio` 必须用 `debian:trixie-slim`（Kamailio 6.0.1），不能改成
+bookworm：bookworm 的 Kamailio 是 5.6.3，其 `ims_registrar_scscf` 在首次注册时会在
+`save()` 里段错误，而且发生在发出任何 Diameter 请求之前。
 
-* 现象：UE 收到 `401`（AKAv1-MD5 挑战，说明 P-CSCF → I-CSCF（UAR/UAA）→ S-CSCF（MAR/MAA）→ HSS 整条链路是通的），UE 也能由向量算出 RES；但 S-CSCF 在认证成功后、写任何数据之前崩掉，于是最终 `200 OK` 不会发出，UE 收到 `504`。
-* 定位：崩溃点固定在 `configs/kamailio/scscf/kamailio.cfg` 里这段实验室改动分支的最后一行：
+这一点很容易误判：从 UE 侧看是"收到 401 挑战、随后收到 504"，而 HSS 日志里什么都
+没有，于是看起来像 Cx 有问题或配置有问题，实际都不是，是 registrar 的版本问题。
+`deploy/scripts/verify.sh` 现在会显式断言 S-CSCF 日志里没有 `signal 11`，一旦回归
+会直接点名，而不是表现为一个含糊的 504。
 
-  ```
-  if (!impu_registered("location")) {
-          xlog("L_ERR", "Not REGISTERED\n");
-          save("PRE_REG_SAR_REPLY", "location");   <-- 崩溃
-  ```
-* 已排除：共享内存不足（已设 `shm_size: 512m`）、`mlock_pages`/`shm_force_alloc`、`ims_usrloc_scscf` 的 `db_mode`、数据库账号与连接。崩溃发生在任何 DB 写入之前（`scscf.impu` 始终为空）。
-* 同一份配置在**宿主机原生跑**时 19/19 通过（见 `test/integration/ims_register.sh`），所以这不是编排问题，而是该分支在容器环境下的 Kamailio 侧缺陷。
-* 因此 `deploy/scripts/verify.sh` 断言到"容器链路里拿到 AKAv1-MD5 挑战、UE 能由向量算出 RES"，并把 200 OK 这一步列为已知限制而不是失败。
+顺带修掉的一个真实缺陷：渲染器改写了 `listen=`，却漏了 `#!define URI
+"sip:127.0.0.1:5062"`，导致节点自报名（`ims_auth` 的 name、`registrar` 的
+`scscf_name`）仍指向 127.0.0.1，与它实际监听的容器地址不一致。现在按角色把自己的
+`127.0.0.1:<port>` 一并改写。
 
-`open5gs-upfd` 需要 `/dev/net/tun` 与 `NET_ADMIN`（compose 已声明）。容器没有 `/dev/net/tun` 时该服务起不来，可以只用 SGW-U（`open5gs-sgwud`，纯 PFCP/GTP-U，无 TUN 需求）承载用户面。
+## Open5GS 镜像
+
+Open5GS 从源码构建，需要完整的 freeDiameter 工具链；`flex` 与 `bison` 容易漏掉，
+漏了会在 `subprojects/freeDiameter/meson.build` 处失败。
+
+open5gs-upfd 需要 /dev/net/tun 与 NET_ADMIN（compose 已声明）。容器没有 /dev/net/tun 时该服务起不来，可以只用 SGW-U（open5gs-sgwud，纯 PFCP/GTP-U，无 TUN 需求）承载用户面。
 
 ## 换端口 / 换地址
 
 `lab.yaml` 里 `network.nodes` 每项对应一个容器地址，改完 `render` 即可；`epdg.http.listen`、`epdg.radius.listen` 等端口会写进 `.env`，compose 的 `ports:` 直接用它们。
 
 注意 `credentials.kamailio_db_password` 与 `credentials.radius_secret`：前者只在 MariaDB **首次初始化**时写入库用户，改口令后需要重建卷（`make clean` 会删除卷）。后者由 render 同时写进 Kamailio 的 `DB_URL`、ePDG 的 `radius.secret` 与 strongSwan 的 `eap-radius` 配置，改完 render + 重启即可。
+
+## S2b 为什么需要额外一个 Diameter 对端
+
+PyHSS 实现的 Diameter 应用是 Cx / Sh / Rx / Gx / S6a / EIR，**没有 S6b**。而
+Open5GS 的 PGW-C 在建立 S2b（WLAN）会话时，会同时发出 Gx CCR 和 S6b AAR，只要
+其中一个没有对端应答，就直接以 cause 100 拒绝会话 —— 这与 ePDG 的请求是否正确
+无关。
+
+因此本实验室把仓库自带的 `test/integration/diampeer` 作为 `aaa` 服务启动，由它
+扮演 PCRF（Gx）与 3GPP AAA（S6b）两个角色。它是一个**测试替身**，不是产品组件；
+如果你部署真实的 PCRF/AAA，把 `lab.yaml` 里的 `network.nodes.aaa` 指向它、或把
+`open5gs.hss_backend` 设为 `open5gs` 即可。
+
+另外两点容易踩：
+
+- freeDiameter 的 `ConnectPeer` 名字必须与该对端自己的 Origin-Host 一致，否则
+  CEA 会被判为非法（日志里是 `save_remote_CE_info: Invalid argument`），对端永远
+  到不了 OPEN，而 SMF 只会报 "No Gx Diameter Peer"，把问题指向错误的方向。
+- PGW-C 需要一个 PFCP 对端才能建会话。`upf` 需要 `/dev/net/tun` 因此单独放在
+  `upf` profile 里；生成的 SMF 配置把 PFCP client 指向 SGW-U（纯 PFCP/GTP-U，
+  无 TUN 需求）。
+
+## 测试
+
+```bash
+sudo -E make -f deploy/Makefile lab-test
+```
+
+按环境可支持程度分层执行，缺组件则 SKIP 而不是失败：
+
+| 层 | 覆盖 | 额外依赖 |
+|---|---|---|
+| `unit` | 协议一致性（go test），无外部服务 | 无 |
+| `container` | 容器栈：容器状态、PyHSS、Cx、IMS REGISTER 401→200、S2b 就绪 | 镜像 |
+| `native-ims` | 三个 CSCF 原生跑，完整 401→200 OK | Kamailio + PyHSS venv |
+| `s2b-container` | 经容器 ePDG + PGW-C 建立/释放 S2b 会话 | `epc` profile |
+| `s2b-native` | 同上，对原生构建的 Open5GS | 源码构建的 Open5GS |
+| `swu` | 完整 SWu 呼叫：IKEv2 + EAP-AKA + IPsec | 带 eap-aka-3gpp 的 strongSwan 源码构建 |
+
+单独跑某一层：`make -f deploy/Makefile lab-test LEVELS="unit container"`。

@@ -87,12 +87,16 @@ func (b *SwanctlBackend) Initiate(ctx context.Context, ueID string) error {
 	return err
 }
 
-// Terminate runs swanctl --terminate for the UE's CHILD_SA.
+// Terminate runs swanctl --terminate for the UE's CHILD_SA. Like the VICI
+// backend it treats a missing SA as already torn down.
 func (b *SwanctlBackend) Terminate(ctx context.Context, ueID string) error {
 	if ueID == "" {
 		return fmt.Errorf("ipsec: ue_id is required")
 	}
 	child := ChildName(config.IPSec{ChildName: b.childName, ChildPrefix: b.childPrefix}, ueID)
 	_, err := b.run(ctx, "--terminate", "--child", child)
+	if err != nil && isNoSuchSA(err) {
+		return nil
+	}
 	return err
 }

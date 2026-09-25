@@ -1,7 +1,13 @@
 # A Kamailio CSCF. One image serves the P-CSCF, I-CSCF and S-CSCF; the role is
 # selected by the KAM_ROLE environment variable and the config directory mounted
 # at /etc/kamailio.
-FROM debian:bookworm-slim
+#
+# The base must be trixie, not bookworm: bookworm ships Kamailio 5.6.3, whose
+# ims_registrar_scscf segfaults on the first registration with these configs,
+# while the 6.0.1 in trixie is the version they were validated against. The
+# failure looks like an application bug (SIGSEGV inside save(), before any
+# Diameter request is sent) and is easy to misattribute to the config.
+FROM debian:trixie-slim
 
 # The IMS modules are what make this an IMS node rather than a plain SIP proxy.
 RUN apt-get update \

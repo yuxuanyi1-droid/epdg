@@ -274,6 +274,8 @@ func (r *Renderer) renderKamailio() error {
 			{fmt.Sprintf("mysql://%s:heslo@127.0.0.1/%s", role.name, role.name),
 				fmt.Sprintf("mysql://%s:%s@%s/%s", role.name, dbPassword, mariadb, role.name)},
 			// Inter-CSCF routing: the P-CSCF needs the I-CSCF, the I-CSCF the S-CSCF.
+			// These come first so a node's own port substitutions below cannot
+			// capture another node's address.
 			{`sip:127.0.0.1:5061`, fmt.Sprintf("sip:%s:5061", icscf)},
 			{`$rd = "127.0.0.1:5062";`, fmt.Sprintf(`$rd = "%s:5062";`, scscf)},
 			{`1 sip:127.0.0.1:5062`, fmt.Sprintf("1 sip:%s:5062", scscf)},
@@ -292,6 +294,9 @@ func (r *Renderer) renderKamailio() error {
 			// grow on demand.
 			{`mlock_pages=yes`, `mlock_pages=no`},
 			{`shm_force_alloc=yes`, `shm_force_alloc=no`},
+			// The P-CSCF advertises itself to the I-CSCF; it must be routable.
+			{`#!define PCSCF_URL "sip:pcscf.localdomain"`,
+				fmt.Sprintf(`#!define PCSCF_URL "sip:%s:5060"`, lab.Network.Node("pcscf"))},
 		}
 		for _, port := range role.ports {
 			subs = append(subs,
@@ -299,13 +304,20 @@ func (r *Renderer) renderKamailio() error {
 				[2]string{`listen=tcp:127.0.0.1:` + port, fmt.Sprintf("listen=tcp:%s:%s", role.self, port)},
 			)
 		}
+		// The node's own SIP URI must name the address its peers can reach.
+		// `#!define URI "sip:127.0.0.1:5062"` feeds ims_auth's name and the
+		// registrar's scscf_name, which go into the Path header and the SAR. If
+		// it keeps pointing at 127.0.0.1 while the node listens on its container
+		// address, the registrar dereferences a lookup that cannot match and the
+		// S-CSCF dies on the first registration. Applied last so it only catches
+		// whatever the inter-node rules above did not already claim.
+		for _, port := range role.ports {
+			subs = append(subs, [2]string{"127.0.0.1:" + port, role.self + ":" + port})
+		}
 		// The Diameter acceptor binds the node address.
 		subs = append(subs, [2]string{role.acceptor,
 			strings.Replace(strings.Replace(role.acceptor, "11.22.33.44", role.self, 1),
 				"127.0.0.1", role.self, 1)})
-		// The P-CSCF advertises itself to the I-CSCF; it must be routable.
-		subs = append(subs, [2]string{`#!define PCSCF_URL "sip:pcscf.localdomain"`,
-			fmt.Sprintf(`#!define PCSCF_URL "sip:%s:5060"`, lab.Network.Node("pcscf"))})
 
 		if err := r.copyTree("configs/kamailio/"+role.name, "kamailio/"+role.name, subs); err != nil {
 			return err
@@ -367,17 +379,26 @@ func (r *Renderer) renderOpen5GS() error {
 		}
 	}
 
-	// freeDiameter carries S6a from the MME and Gx from the SMF, plus the S6a
-	// answer path when Open5GS provides the HSS.
-	peer := lab.Network.Node("pyhss")
+	// freeDiameter carries S6a from the MME and Gx/S6b from the SMF.
+	//
+	// The MME only needs S6a, which PyHSS answers. The SMF needs Gx *and* S6b,
+	// and an S2b (WLAN) session is refused outright unless both have an
+	// answering peer: PyHSS implements Cx, Sh, Rx, Gx and S6a but not S6b, so
+	// the SMF is pointed at the Gx/S6b test peer instead.
+	hssName, hssAddr := "hss.localdomain", lab.Network.Node("pyhss")
 	if lab.Open5GS.HSSBackend == "open5gs" {
-		peer = lab.Network.Node("o5gshss")
+		hssAddr = lab.Network.Node("o5gshss")
 	}
-	for _, p := range []struct{ name, identity, listen string }{
-		{"mme.conf", "mme.localdomain", lab.Network.Node("mme")},
-		{"smf.conf", "smf.localdomain", lab.Network.Node("smf")},
+	smfName, smfAddr := hssName, hssAddr
+	if aaa := lab.Network.Node("aaa"); aaa != "" {
+		smfName, smfAddr = "aaa.localdomain", aaa
+	}
+	for _, p := range []struct{ name, identity, listen, peerName, peerAddr string }{
+		{"mme.conf", "mme.localdomain", lab.Network.Node("mme"), hssName, hssAddr},
+		{"smf.conf", "smf.localdomain", lab.Network.Node("smf"), smfName, smfAddr},
 	} {
-		if err := r.write("freediameter/"+p.name, freeDiameterConf(p.identity, p.listen, peer), nil); err != nil {
+		if err := r.write("freediameter/"+p.name,
+			freeDiameterConf(p.identity, p.listen, p.peerName, p.peerAddr), nil); err != nil {
 			return err
 		}
 	}
@@ -387,7 +408,7 @@ func (r *Renderer) renderOpen5GS() error {
 			{"pcrf.conf", "pcrf.localdomain", lab.Network.Node("o5gpcrf")},
 		} {
 			if err := r.write("freediameter/"+p.name,
-				freeDiameterConf(p.identity, p.listen, lab.Network.Node("smf")), nil); err != nil {
+				freeDiameterConf(p.identity, p.listen, "smf.localdomain", lab.Network.Node("smf")), nil); err != nil {
 				return err
 			}
 		}
@@ -456,7 +477,12 @@ func (r *Renderer) substituteInRuntime(dstRel string, subs [][2]string) error {
 // freeDiameterConf renders a freeDiameter peer that talks to one peer over TCP.
 // TLS material is required by freeDiameter even for plain TCP peers, so the
 // image generates a self-signed certificate at /etc/open5gs/tls.
-func freeDiameterConf(identity, listen, peer string) string {
+//
+// peerName must equal the peer's own Origin-Host. freeDiameter rejects a CEA
+// whose Origin-Host does not match the identity the peer was configured with,
+// and the failure is reported as "save_remote_CE_info: Invalid argument" with
+// the peer never reaching OPEN, which looks like an encoding bug in the peer.
+func freeDiameterConf(identity, listen, peerName, peerAddress string) string {
 	return fmt.Sprintf(`# Generated by labctl from deploy/lab.yaml.
 Identity = "%s";
 Realm = "localdomain";
@@ -470,8 +496,8 @@ LoadExtension = "/usr/lib/freeDiameter/dict_nasreq.fdx";
 LoadExtension = "/usr/lib/freeDiameter/dict_nas_mipv6.fdx";
 LoadExtension = "/usr/lib/freeDiameter/dict_dcca.fdx";
 LoadExtension = "/usr/lib/freeDiameter/dict_dcca_3gpp.fdx";
-ConnectPeer = "hss.localdomain" { ConnectTo = "%s"; No_TLS; No_SCTP; };
-`, identity, listen, peer)
+ConnectPeer = "%s" { ConnectTo = "%s"; No_TLS; No_SCTP; };
+`, identity, listen, peerName, peerAddress)
 }
 
 // generatedOpen5GSYAML supplies the components the repository does not ship a
@@ -492,8 +518,11 @@ smf:
     server:
       - address: {{ .Network.Node "smf" }}
     client:
+      # The SGW-U acts as the user plane. It is a pure PFCP/GTP-U function with
+      # no TUN requirement, whereas the UPF opens a TUN device for its session
+      # subnet and therefore cannot run in every container environment.
       upf:
-        - address: {{ .Network.Node "upf" }}
+        - address: {{ .Network.Node "sgwu" }}
   gtpc:
     server:
       - address: {{ .Network.Node "smf" }}
@@ -534,16 +563,52 @@ upf:
 	}
 }
 
-// renderStrongSwan rewrites the ePDG's strongSwan configuration. The data plane
-// runs in the host network namespace, so it reaches the RADIUS server through
-// the host address.
+// renderStrongSwan writes the ePDG's strongSwan configuration for the host.
+//
+// charon runs in the host network namespace, so the RADIUS server it talks to is
+// reachable at the bridge's host address (the ePDG container publishes 18120
+// there). Its VICI socket lives in a dedicated directory that the ePDG container
+// mounts, rather than at /run/charon.vici: a bind mount whose source does not
+// exist yet is created as a *directory* by the container runtime, which then
+// prevents charon from creating its socket.
 func (r *Renderer) renderStrongSwan() error {
 	lab := r.Lab
 	subs := [][2]string{
 		{"address = 127.0.0.1", fmt.Sprintf("address = %s", lab.Network.HostAddress)},
 		{"secret = pyhss-radius-secret", fmt.Sprintf("secret = %s", lab.Credentials.RadiusSecret)},
 	}
-	return r.copyTree("configs/strongswan", "strongswan", subs)
+	if err := r.copyTree("configs/strongswan", "strongswan", subs); err != nil {
+		return err
+	}
+	// The top level configuration names the VICI socket and pulls in the plugin
+	// configuration, which bootstrap installs at /etc/strongswan.d.
+	data := struct{ Socket string }{Socket: ViciSocketPath}
+	const body = `# Generated by labctl from deploy/lab.yaml. Edit deploy/lab.yaml instead.
+charon {
+  pid_file = ` + ViciDir + `/charon.pid
+  # Keep the pool on demand rather than pre-faulting and wiring it.
+  mlock_pages = no
+  shm_force_alloc = no
+  plugins {
+    vici {
+      socket = unix://{{ .Socket }}
+    }
+    # kernel-libipsec opens /dev/net/tun at start up and aborts charon when the
+    # device is absent, which is the norm in a container-based sandbox. The
+    # kernel-netlink backend still provides IPsec through the kernel XFRM, which
+    # is what the SWu tests use.
+    kernel-libipsec {
+      load = no
+    }
+    kernel-netlink {
+      load = yes
+    }
+  }
+}
+include /etc/strongswan.d/*.conf
+include /etc/strongswan.d/charon/*.conf
+`
+	return r.write("strongswan/strongswan.conf", body, data)
 }
 
 func sortedKeys(m map[string]string) []string {

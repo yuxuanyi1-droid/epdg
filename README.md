@@ -143,9 +143,15 @@ HSS 产生 SAA、P-CSCF 记录 200 OK，且 200 OK 经**严格 IMS IPsec**回程
 
 需要 MariaDB、Redis、Kamailio（含 IMS 模块）与带 PyHSS 依赖的 Python 环境。
 
-### 尚未自动化覆盖
+### 一站式验证
 
-无。上述三个联调脚本覆盖 SWu/EAP-AKA、S2b 与 IMS REGISTER 三条链路。
+```bash
+sudo -E make -f deploy/Makefile lab-test
+```
+
+按环境可支持程度分层执行（协议一致性、容器栈、原生 IMS、容器内 S2b、原生 S2b、
+SWu），缺少源码构建的组件时该层标记为 SKIP 而不是失败。详见
+[deploy/README.md](deploy/README.md)。
 
 ## 容器化实验室与配置台
 

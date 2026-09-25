@@ -4,7 +4,8 @@ FROM debian:bookworm-slim AS build
 ARG OPEN5GS_VERSION=2.7.5
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      build-essential cmake pkg-config curl ca-certificates \
+      build-essential cmake pkg-config curl ca-certificates git \
+      flex bison \
       libssl-dev libgcrypt20-dev libsctp-dev libyaml-dev \
       libcurl4-openssl-dev libtalloc-dev libmongoc-dev \
       libmicrohttpd-dev libidn11-dev libnghttp2-dev \
@@ -33,16 +34,28 @@ RUN apt-get update \
       mariadb-client curl iproute2 iputils-ping openssl \
  && rm -rf /var/lib/apt/lists/*
 
+# The binaries are only half the install. Open5GS also builds its own shared
+# libraries (libogs*), freeDiameter (libfd*) and prometheus-client-c (libprom,
+# which lands in the multiarch directory), plus the freeDiameter extensions
+# (.fdx) that the generated peer configurations load by absolute path.
+# Without them every daemon exits 127 with "error while loading shared libraries".
 COPY --from=build /usr/bin/open5gs-* /usr/bin/
+COPY --from=build /usr/lib/libogs* /usr/lib/
+COPY --from=build /usr/lib/libfd* /usr/lib/
+COPY --from=build /usr/lib/x86_64-linux-gnu/libprom* /usr/lib/x86_64-linux-gnu/
+COPY --from=build /usr/lib/freeDiameter /usr/lib/freeDiameter
+RUN ldconfig
 
 # freeDiameter refuses to start without TLS material, even when every peer is
-# configured No_TLS, so the image carries a self-signed certificate. It is only
-# ever used between containers on the lab bridge.
+# configured No_TLS, and it validates that the certificate owner matches the
+# local DiameterIdentity. Each daemon has a different identity, so one
+# certificate covers them all through subjectAltName.
 RUN mkdir -p /etc/open5gs/default /etc/freeDiameter /etc/open5gs/tls \
  && openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
       -keyout /etc/open5gs/tls/diameter.key \
       -out /etc/open5gs/tls/diameter.crt \
       -subj "/C=IT/O=ePDG Lab/CN=diameter.localdomain" \
+      -addext "subjectAltName=DNS:diameter.localdomain,DNS:mme.localdomain,DNS:smf.localdomain,DNS:hss.localdomain,DNS:pcrf.localdomain" \
  && cp /etc/open5gs/tls/diameter.crt /etc/open5gs/tls/ca.crt \
  && mkdir -p /var/log/open5gs
 
