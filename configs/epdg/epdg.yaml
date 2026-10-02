@@ -25,6 +25,8 @@ aaa:
     # The SWm flavoured endpoint omits CK and IK, so it cannot drive EAP-AKA.
     vector_path_template: /auc/aka/vector_count/1/imsi/{imsi}
     swm_path_template: /auc/swm/eap_aka/plmn/{plmn}/imsi/{imsi}
+    # SQN resynchronisation (AUTS) endpoint; used on AKA Synchronization-Failure.
+    resync_path_template: /auc/aka/resync/imsi/{imsi}/auts/{auts}/rand/{rand}
     oam_ping_path: /oam/ping
     timeout_seconds: 5
 radius:

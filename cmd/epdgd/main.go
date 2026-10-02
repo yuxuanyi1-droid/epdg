@@ -58,7 +58,7 @@ func run(path string, logger *slog.Logger) error {
 	var hssClient *hss.Client
 	if cfg.AAA.Backend == "pyhss_api" {
 		hssClient = hss.New(cfg.AAA.PyHSS.BaseURL, cfg.AAA.PyHSS.VectorPathTemplate,
-			cfg.AAA.PyHSS.OAMPingPath, cfg.AAA.PyHSS.Timeout())
+			cfg.AAA.PyHSS.ResyncPathTemplate, cfg.AAA.PyHSS.OAMPingPath, cfg.AAA.PyHSS.Timeout())
 	}
 
 	ipsecBackend, err := ipsec.New(cfg.IPSec)

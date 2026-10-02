@@ -74,8 +74,12 @@ type PyHSSAPI struct {
 	// VectorPathTemplate must render to an endpoint returning a JSON array of
 	// AKA quintuplets (rand, autn, xres, ck, ik) in hex. The object form used
 	// by /auc/swm/eap_aka omits CK and IK, so the AKA endpoint is the default.
-	VectorPathTemplate string  `yaml:"vector_path_template"`
-	SWMPathTemplate    string  `yaml:"swm_path_template"`
+	VectorPathTemplate string `yaml:"vector_path_template"`
+	SWMPathTemplate    string `yaml:"swm_path_template"`
+	// ResyncPathTemplate reports an AKA Synchronization-Failure so the HSS/AuC
+	// can recalculate the subscriber's SQN from the AUTS (RFC 4187 section 10.6,
+	// 3GPP TS 29.272 section 7.2.5). It must contain {imsi}, {auts} and {rand}.
+	ResyncPathTemplate string  `yaml:"resync_path_template"`
 	OAMPingPath        string  `yaml:"oam_ping_path"`
 	TimeoutSeconds     float64 `yaml:"timeout_seconds"`
 }
@@ -98,7 +102,11 @@ type RADIUS struct {
 	// RequireMessageAuthenticator rejects requests without a valid
 	// Message-Authenticator (RFC 3579 section 3.2).
 	RequireMessageAuthenticator bool `yaml:"require_message_authenticator"`
-	// SendCheckcode includes AT_CHECKCODE in the AKA challenge when true.
+	// SendCheckcode includes AT_CHECKCODE in the AKA challenge when true. The
+	// checkcode is a SHA-1 over the EAP-AKA-Identity messages exchanged; this
+	// server uses EAP-Response/Identity instead, so the attribute is emitted
+	// with an empty checkcode ("no AKA-Identity messages") per RFC 4187
+	// section 10.13.
 	SendCheckcode bool `yaml:"send_checkcode"`
 }
 
@@ -201,6 +209,7 @@ func Default() *Config {
 				BaseURL:            "http://127.0.0.1:8080",
 				VectorPathTemplate: "/auc/aka/vector_count/1/imsi/{imsi}",
 				SWMPathTemplate:    "/auc/swm/eap_aka/plmn/{plmn}/imsi/{imsi}",
+				ResyncPathTemplate: "/auc/aka/resync/imsi/{imsi}/auts/{auts}/rand/{rand}",
 				OAMPingPath:        "/oam/ping",
 				TimeoutSeconds:     5,
 			},

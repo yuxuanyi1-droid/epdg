@@ -128,6 +128,31 @@ func TestParseResponseRoundTrip(t *testing.T) {
 	}
 }
 
+// TestParseResponseAUTS checks the AT_AUTS wire format (RFC 4187 section 10.9):
+// the value is the 14-octet AUTS with no reserved octets, so the encoded
+// attribute is 16 octets with a length field of 4.
+func TestParseResponseAUTS(t *testing.T) {
+	auts := mustHex(t, "00112233445566778899aabbccdd")
+	body := []byte{SubtypeSynchronizationFailure, 0, 0}
+	body = append(body, Attribute{Type: ATAUTS, Value: auts}.Marshal()...)
+	raw := (&Packet{Code: CodeResponse, Identifier: 0x07, Type: TypeAKA, Data: body}).Marshal()
+
+	resp, err := ParseResponse(raw)
+	if err != nil {
+		t.Fatalf("ParseResponse: %v", err)
+	}
+	if resp.Subtype != SubtypeSynchronizationFailure {
+		t.Errorf("subtype = %d, want %d", resp.Subtype, SubtypeSynchronizationFailure)
+	}
+	if !bytes.Equal(resp.AUTS, auts) {
+		t.Errorf("AUTS = %x, want %x", resp.AUTS, auts)
+	}
+	enc := (Attribute{Type: ATAUTS, Value: auts}).Marshal()
+	if len(enc) != 16 || enc[1] != 4 {
+		t.Errorf("encoded AT_AUTS = %x (len %d), want 16 octets with length field 4", enc, len(enc))
+	}
+}
+
 func TestParseResponseRejectsBadLength(t *testing.T) {
 	// Truncated EAP header declared length.
 	raw := []byte{0x02, 0x01, 0x00, 0x40, 0x17, 0x01, 0x00, 0x00}
@@ -140,6 +165,38 @@ func TestParseRejectsNonAKA(t *testing.T) {
 	raw := (&Packet{Code: CodeResponse, Identifier: 1, Type: TypeMD5Challenge, Data: []byte{16}}).Marshal()
 	if _, err := ParseResponse(raw); err == nil {
 		t.Error("ParseResponse accepted an EAP-MD5 packet")
+	}
+}
+
+// TestParseIgnoresPadding checks that octets past the EAP Length field are
+// treated as padding and ignored, as required by RFC 3748 section 4.
+func TestParseIgnoresPadding(t *testing.T) {
+	pkt := (&Packet{Code: CodeRequest, Identifier: 0x01, Type: TypeIdentity}).Marshal()
+	padded := append(append([]byte{}, pkt...), 0xde, 0xad, 0xbe, 0xef)
+	got, err := Parse(padded)
+	if err != nil {
+		t.Fatalf("Parse rejected a padded packet: %v", err)
+	}
+	if got.Code != CodeRequest || got.Type != TypeIdentity || len(got.Data) != 0 {
+		t.Fatalf("unexpected decoded packet: %+v", got)
+	}
+}
+
+// TestBuildChallengeWithEmptyCheckcode verifies the "no AKA-Identity messages
+// were exchanged" form of AT_CHECKCODE: the attribute is present but carries no
+// checkcode, so it is exactly four octets (RFC 4187 section 10.13).
+func TestBuildChallengeWithEmptyCheckcode(t *testing.T) {
+	rand := mustHex(t, "00112233445566778899aabbccddeeff")
+	autn := mustHex(t, "11223344556677889900aabbccddeeff")
+	raw, err := BuildChallengeWithCheckcode(0x07, rand, autn, mustHex(t, katKAut), []byte{})
+	if err != nil {
+		t.Fatalf("BuildChallengeWithCheckcode: %v", err)
+	}
+	if !bytes.Contains(raw, []byte{ATCheckcode, 0x01, 0x00, 0x00}) {
+		t.Errorf("challenge does not carry a 4-octet AT_CHECKCODE: %x", raw)
+	}
+	if _, _, ok, err := VerifyMAC(raw, mustHex(t, katKAut)); err != nil || !ok {
+		t.Errorf("AT_MAC did not verify with AT_CHECKCODE present (ok=%v err=%v)", ok, err)
 	}
 }
 

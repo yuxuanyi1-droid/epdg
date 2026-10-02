@@ -57,15 +57,19 @@ type Packet struct {
 	Data []byte
 }
 
-// Parse decodes and validates an EAP packet. The Length field must match the
-// number of octets received (RFC 3748 section 4).
+// Parse decodes and validates an EAP packet. The Length field must not exceed
+// the number of octets received; any octets past the Length field are padding
+// and are ignored on reception (RFC 3748 section 4).
 func Parse(raw []byte) (*Packet, error) {
 	if len(raw) < headerLen {
 		return nil, fmt.Errorf("eap: packet too short: %d octets", len(raw))
 	}
 	length := int(binary.BigEndian.Uint16(raw[2:4]))
-	if length != len(raw) {
-		return nil, fmt.Errorf("eap: Length field is %d but %d octets were received", length, len(raw))
+	if length < headerLen {
+		return nil, fmt.Errorf("eap: Length field %d is below the %d octet header", length, headerLen)
+	}
+	if length > len(raw) {
+		return nil, fmt.Errorf("eap: Length field is %d but only %d octets were received", length, len(raw))
 	}
 	p := &Packet{Code: Code(raw[0]), Identifier: raw[1]}
 	switch p.Code {
@@ -74,7 +78,7 @@ func Parse(raw []byte) (*Packet, error) {
 			return nil, errors.New("eap: Request/Response without Type octet")
 		}
 		p.Type = raw[4]
-		p.Data = append([]byte{}, raw[5:]...)
+		p.Data = append([]byte{}, raw[5:length]...)
 	default:
 		if length != headerLen {
 			return nil, fmt.Errorf("eap: %s must be %d octets, got %d", p.Code, headerLen, length)

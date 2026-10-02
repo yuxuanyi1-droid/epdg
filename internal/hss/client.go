@@ -31,19 +31,22 @@ type Vector struct {
 type Client struct {
 	baseURL            string
 	vectorPathTemplate string
+	resyncPathTemplate string
 	oamPingPath        string
 	http               *http.Client
 }
 
 // New builds a client. vectorPathTemplate must contain an {imsi} placeholder
-// and may contain a {plmn} placeholder.
-func New(baseURL, vectorPathTemplate, oamPingPath string, timeout time.Duration) *Client {
+// and may contain a {plmn} placeholder. resyncPathTemplate may be empty when
+// the HSS does not offer SQN resynchronisation.
+func New(baseURL, vectorPathTemplate, resyncPathTemplate, oamPingPath string, timeout time.Duration) *Client {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
 	return &Client{
 		baseURL:            strings.TrimRight(baseURL, "/"),
 		vectorPathTemplate: vectorPathTemplate,
+		resyncPathTemplate: resyncPathTemplate,
 		oamPingPath:        oamPingPath,
 		http:               &http.Client{Timeout: timeout},
 	}
@@ -114,6 +117,36 @@ func (c *Client) Vector(ctx context.Context, imsi string) (*Vector, error) {
 		return nil, fmt.Errorf("hss: %s returned an empty vector list", path)
 	}
 	return decodeVector(list[0])
+}
+
+// Resync reports an AKA Synchronization-Failure to the HSS so that the AuC can
+// recompute the subscriber's SQN from the AUTS (RFC 4187 section 10.6 and
+// 3GPP TS 29.272 section 7.2.5). The RAND must be the one the ePDG sent in the
+// challenge the peer rejected. The EAP-AKA Synchronization-Failure message
+// intentionally carries no AT_MAC (RFC 4187 section 9.6), so the AUTS is only
+// trustworthy once the AuC, which holds K, validates it.
+func (c *Client) Resync(ctx context.Context, imsi string, auts, rand []byte) error {
+	if imsi == "" {
+		return errors.New("hss: imsi is required")
+	}
+	if c.resyncPathTemplate == "" {
+		return errors.New("hss: no resynchronisation endpoint is configured")
+	}
+	if len(auts) == 0 || len(rand) == 0 {
+		return errors.New("hss: AUTS and RAND are required for a resynchronisation")
+	}
+	path := strings.ReplaceAll(c.resyncPathTemplate, "{imsi}", url.PathEscape(imsi))
+	path = strings.ReplaceAll(path, "{auts}", hex.EncodeToString(auts))
+	path = strings.ReplaceAll(path, "{rand}", hex.EncodeToString(rand))
+
+	body, status, err := c.get(ctx, path)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("hss: %s returned HTTP %d: %s", path, status, truncate(body))
+	}
+	return nil
 }
 
 func decodeVector(raw akaVectorJSON) (*Vector, error) {

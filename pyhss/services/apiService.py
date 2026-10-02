@@ -5,6 +5,7 @@
 # Copyright 2025 Lennart Rosam <hello@takuto.de>
 # SPDX-License-Identifier: AGPL-3.0-or-later
 import sys
+import binascii
 import json
 from flask import Flask, request, jsonify, Response
 from flask_restx import Api, Resource, fields, reqparse, abort
@@ -539,8 +540,10 @@ class PyHSS_AUC_Get_AKA_Vectors_Resync(Resource):
             #Get data from AuC
             auc_data = databaseClient.Get_AuC(imsi=imsi)
             rand = binascii.unhexlify(rand)
-            vector_dict = databaseClient.Get_Vectors_AuC(auc_data['auc_id'], action='sqn_resync', auts=auts, rand=rand)
-            return vector_dict, 200
+            # Get_Vectors_AuC(action='sqn_resync') recalculates and stores the
+            # SQN from the AUTS; it does not return a vector.
+            databaseClient.Get_Vectors_AuC(auc_data['auc_id'], action='sqn_resync', auts=auts, rand=rand)
+            return {"result": "ok"}, 200
         except Exception as E:
             print(E)
             return handle_exception(E)

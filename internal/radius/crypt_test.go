@@ -31,20 +31,24 @@ const (
 )
 
 // TestFinalizeResponseKnownAnswer checks the Access-Challenge encoding byte for
-// byte against the output of pyrad, an independent RADIUS implementation, with
-// an identical attribute order (RFC 2865 section 5.2 and RFC 3579 section 3.2).
+// byte against an independent implementation, with an identical attribute order
+// (RFC 2865 section 5.2 and RFC 3579 section 3.2).
 func TestFinalizeResponseKnownAnswer(t *testing.T) {
-	// Expected octets produced by pyrad for the same attributes in the same
-	// order: EAP-Message, Reply-Message, Message-Authenticator.
-	const want = "0b2a007b061a1677cfe38160be1c83e49236723f" +
+	// Expected octets produced by an independent implementation (Python
+	// hmac/hashlib) for the same attributes in the same order: EAP-Message,
+	// State, Message-Authenticator. Reply-Message is deliberately absent
+	// because RFC 3579 section 2.6.5 forbids it in any packet that carries an
+	// EAP-Message attribute.
+	const stateHex = "0f0e0d0c0b0a09080706050403020100"
+	const want = "0b2a007ebf306afaea8e121ccbcffb60bc3fb85e" +
 		"4f46" + katEAPChallenge +
-		"120f616b61206368616c6c656e6765" +
-		"501283bc8e98045b9e50dbc6c9eba8095be1"
+		"1812" + stateHex +
+		"5012734e251c0eb0900461d672cd91a6c6eb"
 
 	reqAuth := mustAuth(t, "00112233445566778899aabbccddeeff")
 	p := &Packet{Code: CodeAccessChallenge, Identifier: 0x2a}
 	p.Add(AttrEAPMessage, mustHex(t, katEAPChallenge))
-	p.Add(AttrReplyMessage, []byte("aka challenge"))
+	p.Add(AttrState, mustHex(t, stateHex))
 	if err := p.FinalizeResponse([]byte(katSecret), reqAuth); err != nil {
 		t.Fatalf("FinalizeResponse: %v", err)
 	}
@@ -67,8 +71,13 @@ func TestFinalizeResponseKnownAnswer(t *testing.T) {
 	if !bytes.Equal(back.EAPMessage(), mustHex(t, katEAPChallenge)) {
 		t.Error("round trip changed the EAP-Message payload")
 	}
-	if got, _ := back.Get(AttrReplyMessage); string(got) != "aka challenge" {
-		t.Errorf("round trip changed Reply-Message to %q", got)
+	if got, _ := back.Get(AttrState); !bytes.Equal(got, mustHex(t, stateHex)) {
+		t.Errorf("round trip changed State to %x", got)
+	}
+	// A packet carrying EAP-Message must not carry Reply-Message
+	// (RFC 3579 section 2.6.5 and the attribute table in section 3.3).
+	if _, ok := back.Get(AttrReplyMessage); ok {
+		t.Error("a RADIUS packet with an EAP-Message must not carry Reply-Message")
 	}
 	if back.Authenticator != reqAuth {
 		// The transmitted Authenticator is the Response Authenticator, which

@@ -92,11 +92,20 @@ func ParseAttributes(raw []byte) ([]Attribute, error) {
 // the 4 octet EAP header, the Type octet and the 3 octet Subtype/Reserved
 // header.
 func locateMAC(raw []byte) (int, error) {
+	if len(raw) < headerLen {
+		return 0, errors.New("eap-aka: packet too short while locating AT_MAC")
+	}
+	// Honour the EAP Length field so trailing padding (RFC 3748 section 4) is
+	// not mistaken for an attribute.
+	end := int(binary.BigEndian.Uint16(raw[2:4]))
+	if end > len(raw) {
+		end = len(raw)
+	}
 	pos := headerLen + 1 + akaHeaderLen
-	for pos+2 <= len(raw) {
+	for pos+2 <= end {
 		typ := raw[pos]
 		length := int(raw[pos+1]) * 4
-		if length < 4 || pos+length > len(raw) {
+		if length < 4 || pos+length > end {
 			return 0, fmt.Errorf("eap-aka: malformed attribute at offset %d while locating AT_MAC", pos)
 		}
 		if typ == ATMAC {
@@ -207,10 +216,12 @@ func ParseResponse(raw []byte) (*Response, error) {
 			}
 			resp.MAC = append([]byte{}, a.Value[2:18]...)
 		case ATAUTS:
-			if len(a.Value) < 16 {
+			// RFC 4187 section 10.9: AT_AUTS carries the 14-octet AUTS with no
+			// reserved octets (unlike AT_RAND/AT_AUTN/AT_MAC).
+			if len(a.Value) < 14 {
 				return nil, errors.New("eap-aka: AT_AUTS too short")
 			}
-			resp.AUTS = append([]byte{}, a.Value[2:16]...)
+			resp.AUTS = append([]byte{}, a.Value[:14]...)
 		case ATNotification:
 			if len(a.Value) < 2 {
 				return nil, errors.New("eap-aka: AT_NOTIFICATION too short")

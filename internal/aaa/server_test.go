@@ -1,6 +1,7 @@
 package aaa
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"log/slog"
@@ -29,10 +30,20 @@ var recordedVector = &hss.Vector{
 	IK:   mustHex("9df3be5b1cef88535c8e05c92119ca37"),
 }
 
-type recordedSource struct{ vector *hss.Vector }
+type recordedSource struct {
+	vector   *hss.Vector
+	onResync func(imsi string, auts, rand []byte) error
+}
 
 func (r recordedSource) Vector(context.Context, string) (*hss.Vector, error) {
 	return r.vector, nil
+}
+
+func (r recordedSource) Resync(_ context.Context, imsi string, auts, rand []byte) error {
+	if r.onResync != nil {
+		return r.onResync(imsi, auts, rand)
+	}
+	return nil
 }
 
 func mustHex(s string) []byte {
@@ -101,8 +112,7 @@ func TestEAPAKAExchange(t *testing.T) {
 		t.Fatalf("Parse(Access-Challenge): %v", err)
 	}
 	if challenge.Code != radius.CodeAccessChallenge {
-		t.Fatalf("reply code = %s, want Access-Challenge (%s)",
-			radius.CodeString(challenge.Code), string(mustGet(challenge, radius.AttrReplyMessage)))
+		t.Fatalf("reply code = %s, want Access-Challenge", radius.CodeString(challenge.Code))
 	}
 	if !radius.VerifyResponseAuthenticator(challengeRaw, []byte(testSecret), request.Authenticator) {
 		t.Error("Access-Challenge Response Authenticator does not verify")
@@ -110,6 +120,11 @@ func TestEAPAKAExchange(t *testing.T) {
 	state, ok := challenge.Get(radius.AttrState)
 	if !ok || len(state) == 0 {
 		t.Fatal("Access-Challenge is missing the State attribute")
+	}
+	// RFC 3579 section 2.6.5: Reply-Message MUST NOT appear in a packet that
+	// carries an EAP-Message.
+	if _, ok := challenge.Get(radius.AttrReplyMessage); ok {
+		t.Error("Access-Challenge must not carry Reply-Message alongside EAP-Message")
 	}
 
 	// Act as the UE: derive the keys and answer with AT_RES plus a correct
@@ -153,8 +168,15 @@ func TestEAPAKAExchange(t *testing.T) {
 		t.Fatalf("Parse(Access-Accept): %v", err)
 	}
 	if accept.Code != radius.CodeAccessAccept {
-		t.Fatalf("reply code = %s, want Access-Accept (%s)",
-			radius.CodeString(accept.Code), string(mustGet(accept, radius.AttrReplyMessage)))
+		t.Fatalf("reply code = %s, want Access-Accept", radius.CodeString(accept.Code))
+	}
+	if _, ok := accept.Get(radius.AttrReplyMessage); ok {
+		t.Error("Access-Accept must not carry Reply-Message alongside EAP-Message")
+	}
+	// RFC 3579 section 3: if the Access-Request carried User-Name, the
+	// Access-Accept must echo it for EAP-unaware proxies.
+	if un, ok := accept.Get(radius.AttrUserName); !ok || string(un) != testNAI {
+		t.Errorf("Access-Accept must echo User-Name %q, got %q", testNAI, un)
 	}
 
 	// The MSK must be handed back as MS-MPPE-Recv-Key || MS-MPPE-Send-Key, which
@@ -177,6 +199,78 @@ func TestEAPAKAExchange(t *testing.T) {
 	}
 	if !equalBytes(append(append([]byte{}, recv...), send...), keys.MSK) {
 		t.Error("the MSK delivered to the NAS does not match the UE's MSK")
+	}
+}
+
+// TestAKASynchronizationFailureResync checks that an EAP-Response/
+// AKA-Synchronization-Failure is reported to the vector source with the AUTS
+// and the RAND of the rejected challenge, and that the server then answers with
+// a fresh AKA challenge (RFC 4187 sections 9.6 and 10.6).
+func TestAKASynchronizationFailureResync(t *testing.T) {
+	var gotIMSI string
+	var gotAUTS, gotRAND []byte
+	source := recordedSource{
+		vector: recordedVector,
+		onResync: func(imsi string, auts, rand []byte) error {
+			gotIMSI, gotAUTS, gotRAND = imsi, auts, rand
+			return nil
+		},
+	}
+	server := NewServer(ServerConfig{
+		Secret:                      testSecret,
+		RequireMessageAuthenticator: true,
+		SessionTTL:                  time.Minute,
+	}, source, discardLogger())
+	ctx := context.Background()
+
+	identity := (&eap.Packet{Code: eap.CodeResponse, Identifier: 0x01, Type: eap.TypeIdentity, Data: []byte(testNAI)}).Marshal()
+	raw, _ := buildRequest(t, 0x2a, identity)
+	challengeRaw := server.Handle(ctx, raw, peerAddr())
+	challenge, err := radius.Parse(challengeRaw)
+	if err != nil {
+		t.Fatalf("Parse(Access-Challenge): %v", err)
+	}
+	state, _ := challenge.Get(radius.AttrState)
+
+	// The peer reports a stale SQN: EAP-Response/AKA-Synchronization-Failure
+	// carries AT_AUTS and, per RFC 4187 section 9.6, no AT_MAC.
+	// AT_AUTS has no reserved octets: its value is the 14-octet AUTS
+	// (RFC 4187 section 10.9).
+	auts := mustHex("00112233445566778899aabbccdd")
+	body := []byte{eap.SubtypeSynchronizationFailure, 0, 0}
+	body = append(body, eap.Attribute{Type: eap.ATAUTS, Value: auts}.Marshal()...)
+	syncEAP := (&eap.Packet{Code: eap.CodeResponse, Identifier: challenge.EAPMessage()[1], Type: eap.TypeAKA, Data: body}).Marshal()
+
+	raw2, _ := buildRequest(t, 0x2b, syncEAP)
+	req2, err := radius.Parse(raw2)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	req2.Add(radius.AttrState, state)
+	if err := req2.SetMessageAuthenticator([]byte(testSecret)); err != nil {
+		t.Fatalf("SetMessageAuthenticator: %v", err)
+	}
+	raw2, err = req2.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	replyRaw := server.Handle(ctx, raw2, peerAddr())
+	reply, err := radius.Parse(replyRaw)
+	if err != nil {
+		t.Fatalf("Parse(Access-Challenge): %v", err)
+	}
+	if reply.Code != radius.CodeAccessChallenge {
+		t.Fatalf("reply code = %s, want Access-Challenge", radius.CodeString(reply.Code))
+	}
+	if gotIMSI != "001010000000001" {
+		t.Errorf("resync IMSI = %q, want 001010000000001", gotIMSI)
+	}
+	if !bytes.Equal(gotAUTS, auts) {
+		t.Errorf("resync AUTS = %x, want %x", gotAUTS, auts)
+	}
+	if !bytes.Equal(gotRAND, recordedVector.RAND) {
+		t.Errorf("resync RAND = %x, want the challenge RAND %x", gotRAND, recordedVector.RAND)
 	}
 }
 
@@ -223,10 +317,21 @@ func TestAccessRejectOnWrongRES(t *testing.T) {
 	if reply.Code != radius.CodeAccessReject {
 		t.Fatalf("reply code = %s, want Access-Reject", radius.CodeString(reply.Code))
 	}
+	// RFC 3579 sections 2.2 and 3.3: a fatal error must be reported with an
+	// Access-Reject carrying an EAP-Failure, and never with Reply-Message.
+	if fm := reply.EAPMessage(); len(fm) < 4 || fm[0] != byte(eap.CodeFailure) {
+		t.Errorf("Access-Reject must carry an EAP-Failure, got %x", fm)
+	}
+	if _, ok := reply.Get(radius.AttrReplyMessage); ok {
+		t.Error("Access-Reject must not carry Reply-Message alongside EAP-Message")
+	}
 	_ = request
 }
 
-func TestAccessRejectWithoutMessageAuthenticator(t *testing.T) {
+// TestSilentlyDiscardsWithoutMessageAuthenticator verifies RFC 3579 section 3.1:
+// an Access-Request carrying an EAP-Message but no Message-Authenticator is
+// silently discarded, so the server returns no reply at all.
+func TestSilentlyDiscardsWithoutMessageAuthenticator(t *testing.T) {
 	server := newTestServer(t)
 	identity := (&eap.Packet{Code: eap.CodeResponse, Identifier: 1, Type: eap.TypeIdentity, Data: []byte(testNAI)}).Marshal()
 	request := &radius.Packet{Code: radius.CodeAccessRequest, Identifier: 1}
@@ -238,12 +343,31 @@ func TestAccessRejectWithoutMessageAuthenticator(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
-	reply, err := radius.Parse(server.Handle(context.Background(), raw, peerAddr()))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
+	if reply := server.Handle(context.Background(), raw, peerAddr()); reply != nil {
+		t.Errorf("server answered a request without a Message-Authenticator: %x", reply)
 	}
-	if reply.Code != radius.CodeAccessReject {
-		t.Errorf("reply code = %s, want Access-Reject", radius.CodeString(reply.Code))
+}
+
+// TestSilentlyDiscardsBadMessageAuthenticator verifies the MUST in RFC 3579
+// section 3.1: a request whose Message-Authenticator does not verify is
+// silently discarded.
+func TestSilentlyDiscardsBadMessageAuthenticator(t *testing.T) {
+	server := newTestServer(t)
+	identity := (&eap.Packet{Code: eap.CodeResponse, Identifier: 1, Type: eap.TypeIdentity, Data: []byte(testNAI)}).Marshal()
+	request := &radius.Packet{Code: radius.CodeAccessRequest, Identifier: 1}
+	auth, _ := radius.RandomAuthenticator()
+	request.Authenticator = auth
+	request.Add(radius.AttrUserName, []byte(testNAI))
+	request.SetEAPMessage(identity)
+	if err := request.SetMessageAuthenticator([]byte("wrong-secret")); err != nil {
+		t.Fatalf("SetMessageAuthenticator: %v", err)
+	}
+	raw, err := request.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if reply := server.Handle(context.Background(), raw, peerAddr()); reply != nil {
+		t.Errorf("server answered a request with an invalid Message-Authenticator: %x", reply)
 	}
 }
 
