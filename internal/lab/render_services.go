@@ -268,6 +268,20 @@ func (r *Renderer) renderKamailio() error {
 			acceptor: `<Acceptor port="3870" bind="127.0.0.1"/>`},
 	}
 
+	// The IMS identities and the HSS/rtpengine endpoints come from the `ims`
+	// section. The left hand sides are the literals shipped in configs/kamailio;
+	// copyTree ignores the ones that do not match a given file, so one list
+	// covers all three CSCFs.
+	imsSubs := [][2]string{
+		{"ims.mnc001.mcc001.3gppnetwork.org", lab.IMS.Domain},
+		{"pcscf.mnc001.mcc001.3gppnetwork.org", lab.IMS.PCSCFFQDN},
+		{"pcrf.mnc001.mcc001.3gppnetwork.org", lab.IMS.PCRFFQDN},
+		{"hss.localdomain", lab.IMS.DiameterHSS},
+		{`port="3868"`, fmt.Sprintf(`port="%d"`, lab.IMS.DiameterPort)},
+		{"udp:localhost:9910", "udp:" + lab.IMS.RTPEngineAddress},
+		{"udp:localhost:9911", "udp:" + lab.IMS.RTPEngineAddress},
+	}
+
 	for _, role := range roles {
 		subs := [][2]string{
 			// Database. The shipped configs point at a local mysqld.
@@ -318,6 +332,7 @@ func (r *Renderer) renderKamailio() error {
 		subs = append(subs, [2]string{role.acceptor,
 			strings.Replace(strings.Replace(role.acceptor, "11.22.33.44", role.self, 1),
 				"127.0.0.1", role.self, 1)})
+		subs = append(subs, imsSubs...)
 
 		if err := r.copyTree("configs/kamailio/"+role.name, "kamailio/"+role.name, subs); err != nil {
 			return err

@@ -49,6 +49,8 @@ PYHSS_PORT="${PYHSS_PORT:-8080}"
 RADIUS_PORT="${RADIUS_PORT:-18120}"
 RADIUS_SECRET="pyhss-radius-secret"
 EPDG_HTTP_PORT="${EPDG_HTTP_PORT:-19090}"
+# SEQ_CHECK=yes makes the UE reject the SQN and drive the resynchronisation path.
+SEQ_CHECK="${SEQ_CHECK:-no}"
 
 EPDGD_BIN="$WORK/epdgd"
 PYHSS_DB="$WORK/hss.db"
@@ -239,7 +241,10 @@ charon {
       socket = unix://$WORK/ue/charon.vici
     }
     eap-aka-3gpp {
-      seq_check = no
+      # seq_check=yes makes the test card reject the HSS SQN and send
+      # EAP-Response/AKA-Synchronization-Failure, which exercises the AUTS/SQN
+      # resynchronisation path (RFC 4187 section 10.6).
+      seq_check = ${SEQ_CHECK:-no}
     }
   }
 }
@@ -488,6 +493,24 @@ check_radius_exchange() {
 	echo "--------------------"
 }
 
+# check_resync asserts the SQN resynchronisation path when the UE is configured
+# to reject the SQN (SEQ_CHECK=yes): the ePDG must report the AUTS to the HSS and
+# then issue a fresh challenge (RFC 4187 section 10.6).
+check_resync() {
+	[ "$SEQ_CHECK" = "yes" ] || return 0
+	log "verifying the SQN resynchronisation path"
+	if grep -q "resynchronisation challenge" "$WORK/epdg/epdgd.log"; then
+		ok "the ePDG resynchronised the SQN after the UE rejected it"
+	else
+		bad "the ePDG never resynchronised after the UE rejected the SQN"
+	fi
+	if grep -qE "Resync SQN|sqn_resync" "$WORK/pyhss.log"; then
+		ok "the HSS recalculated the SQN from the AUTS"
+	else
+		bad "the HSS never recalculated the SQN"
+	fi
+}
+
 check_data_path() {
 	log "verifying the data path through the tunnel"
 	local vip
@@ -567,6 +590,7 @@ main() {
 	check_ue_sa
 	check_epdg_sa
 	check_radius_exchange
+	check_resync
 	check_data_path
 	check_compliance
 	summary

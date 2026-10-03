@@ -124,3 +124,10 @@ enb:
         - EIA2
         - EIA1
         - EIA0
+ims:
+    domain: ims.mnc001.mcc001.3gppnetwork.org
+    pcscf_fqdn: pcscf.mnc001.mcc001.3gppnetwork.org
+    pcrf_fqdn: pcrf.mnc001.mcc001.3gppnetwork.org
+    diameter_hss: hss.localdomain
+    diameter_port: 3868
+    rtpengine_address: localhost:9910

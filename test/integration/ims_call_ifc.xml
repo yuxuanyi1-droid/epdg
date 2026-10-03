@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Minimal IMS service profile used by ims_call.sh. The shipped default_ifc.xml
+  routes INVITE to an Application Server (applicationserver.*) that the lab does
+  not run, so the S-CSCF would divert the call away from the callee. This profile
+  keeps only the public identities, which lets the S-CSCF terminate the call on
+  the registered UE.
+-->
+<IMSSubscription>
+    <PrivateID>{{ iFC_vars['imsi'] }}@ims.mnc{{ iFC_vars['mnc'] }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org</PrivateID>
+    <ServiceProfile>
+        <PublicIdentity>
+            <Identity>sip:{{ iFC_vars['imsi'] }}@ims.mnc{{ iFC_vars['mnc'] }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org</Identity>
+        </PublicIdentity>
+    </ServiceProfile>
+</IMSSubscription>

@@ -198,6 +198,35 @@ const SCHEMA = [
       },
     ],
   },
+  {
+    id: "ims",
+    num: "05",
+    title: "IMS（Kamailio CSCF）",
+    note: "P/I/S-CSCF 的身份、面向 HSS/PCRF 的 Diameter 对端与 rtpengine 控制地址",
+    groups: [
+      {
+        label: "IMS 身份",
+        fields: [
+          { key: "ims.domain", label: "IMS 域", type: "text", hint: "如 ims.mnc001.mcc001.3gppnetwork.org" },
+          { key: "ims.pcscf_fqdn", label: "P-CSCF FQDN", type: "text" },
+          { key: "ims.pcrf_fqdn", label: "PCRF FQDN", type: "text" },
+        ],
+      },
+      {
+        label: "Diameter",
+        fields: [
+          { key: "ims.diameter_hss", label: "HSS 主机", type: "text", hint: "I/S-CSCF 的 Cx 对端" },
+          { key: "ims.diameter_port", label: "HSS 端口", type: "number" },
+        ],
+      },
+      {
+        label: "媒体（rtpengine）",
+        fields: [
+          { key: "ims.rtpengine_address", label: "rtpengine 控制地址", type: "text", hint: "host:port，如 rtpengine:22222" },
+        ],
+      },
+    ],
+  },
 ];
 
 // ---------------------------------------------------------------- state

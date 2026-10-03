@@ -6,6 +6,7 @@ package lab
 
 import (
 	"fmt"
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -22,6 +23,7 @@ type Lab struct {
 	EPDG        EPDG        `yaml:"epdg" json:"epdg"`
 	Open5GS     Open5GS     `yaml:"open5gs" json:"open5gs"`
 	ENB         ENB         `yaml:"enb" json:"enb"`
+	IMS         IMS         `yaml:"ims" json:"ims"`
 }
 
 // Network holds the bridge definition and the static address of every node.
@@ -157,6 +159,47 @@ type ENB struct {
 	IntegAlgoPref  []string `yaml:"integ_algo_pref" json:"integ_algo_pref"`
 }
 
+// IMS is the Kamailio CSCF configuration. The values default to the ones the
+// shipped configs under configs/kamailio hard code, so a lab.yaml that predates
+// this section still renders.
+type IMS struct {
+	// Domain is the IMS home domain, for example ims.mnc001.mcc001.3gppnetwork.org.
+	Domain string `yaml:"domain" json:"domain"`
+	// PCSCFFQDN and PCRFFQDN are the P-CSCF and PCRF Diameter identities.
+	PCSCFFQDN string `yaml:"pcscf_fqdn" json:"pcscf_fqdn"`
+	PCRFFQDN  string `yaml:"pcrf_fqdn" json:"pcrf_fqdn"`
+	// DiameterHSS and DiameterPort are the HSS peer the I/S-CSCF connect to.
+	DiameterHSS  string `yaml:"diameter_hss" json:"diameter_hss"`
+	DiameterPort int    `yaml:"diameter_port" json:"diameter_port"`
+	// RTPEngineAddress is the rtpengine NG control endpoint (host:port) used
+	// for both the originating and terminating media sets.
+	RTPEngineAddress string `yaml:"rtpengine_address" json:"rtpengine_address"`
+}
+
+// applyDefaults fills IMS fields that were not present in the YAML, deriving the
+// domain from the PLMN so the two do not silently disagree.
+func (l *Lab) applyDefaults() {
+	base := fmt.Sprintf("mnc%s.mcc%s.3gppnetwork.org", l.PLMN.MNC3, l.PLMN.MCC)
+	if l.IMS.Domain == "" {
+		l.IMS.Domain = "ims." + base
+	}
+	if l.IMS.PCSCFFQDN == "" {
+		l.IMS.PCSCFFQDN = "pcscf." + base
+	}
+	if l.IMS.PCRFFQDN == "" {
+		l.IMS.PCRFFQDN = "pcrf." + base
+	}
+	if l.IMS.DiameterHSS == "" {
+		l.IMS.DiameterHSS = "hss.localdomain"
+	}
+	if l.IMS.DiameterPort == 0 {
+		l.IMS.DiameterPort = 3868
+	}
+	if l.IMS.RTPEngineAddress == "" {
+		l.IMS.RTPEngineAddress = "localhost:9910"
+	}
+}
+
 // Load reads and validates a lab definition.
 func Load(path string) (*Lab, error) {
 	raw, err := os.ReadFile(path)
@@ -169,6 +212,7 @@ func Load(path string) (*Lab, error) {
 	if err := dec.Decode(lab); err != nil {
 		return nil, fmt.Errorf("lab: cannot parse %s: %w", path, err)
 	}
+	lab.applyDefaults()
 	if err := lab.Validate(); err != nil {
 		return nil, fmt.Errorf("lab: %s: %w", path, err)
 	}
@@ -271,6 +315,34 @@ func (l *Lab) Validate() error {
 	}
 	if l.EPDG.Enabled && l.EPDG.Protocol.S2b.Backend == "gtpv2" && l.EPDG.Protocol.S2b.LocalAddress == "" {
 		return fmt.Errorf("epdg.protocol.s2b.local_address is required for the gtpv2 backend")
+	}
+	if err := validateIMS(l.IMS); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateIMS keeps the IMS identities routable and the Diameter endpoint sane.
+func validateIMS(ims IMS) error {
+	for _, f := range []struct {
+		key, value string
+	}{
+		{"ims.domain", ims.Domain},
+		{"ims.pcscf_fqdn", ims.PCSCFFQDN},
+		{"ims.pcrf_fqdn", ims.PCRFFQDN},
+	} {
+		if !strings.Contains(f.value, ".") {
+			return fmt.Errorf("%s %q must be a fully qualified domain name", f.key, f.value)
+		}
+	}
+	if ims.DiameterHSS == "" {
+		return fmt.Errorf("ims.diameter_hss must be set")
+	}
+	if ims.DiameterPort < 1 || ims.DiameterPort > 65535 {
+		return fmt.Errorf("ims.diameter_port %d must be between 1 and 65535", ims.DiameterPort)
+	}
+	if _, _, err := net.SplitHostPort(ims.RTPEngineAddress); err != nil {
+		return fmt.Errorf("ims.rtpengine_address %q must be host:port: %w", ims.RTPEngineAddress, err)
 	}
 	return nil
 }

@@ -182,6 +182,8 @@ func (s *Server) section(name string) (any, bool) {
 		return &s.lab.Open5GS, true
 	case "enb":
 		return &s.lab.ENB, true
+	case "ims":
+		return &s.lab.IMS, true
 	default:
 		return nil, false
 	}
@@ -202,6 +204,8 @@ func (s *Server) target(l *Lab, name string) any {
 		return &l.Open5GS
 	case "enb":
 		return &l.ENB
+	case "ims":
+		return &l.IMS
 	default:
 		return nil
 	}

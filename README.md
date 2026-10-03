@@ -143,6 +143,26 @@ HSS 产生 SAA、P-CSCF 记录 200 OK，且 200 OK 经**严格 IMS IPsec**回程
 
 需要 MariaDB、Redis、Kamailio（含 IMS 模块）与带 PyHSS 依赖的 Python 环境。
 
+### IMS 通话 + Kamailio 真实联调
+
+在 REGISTER 链路之上完成一次真实的 INVITE 对话（两个 UE 注册、A 呼 B、
+180/200 OK、ACK、BYE），**14/14 通过**：
+
+```bash
+sudo -E PYHSS_PYTHON=/path/to/venv/bin/python test/integration/ims_call.sh
+```
+
+仓库内没有 UE 侧的 IMS IPsec 协议栈，因此脚本只对安装到 `/etc` 的 CSCF 配置做
+最小放宽（P-CSCF 在 Path 中通告自身 IP、S-CSCF 终结本域用户、订户使用不含
+Application Server 的 iFC），`configs/kamailio/` 保持原样。
+
+EAP-AKA 的 SQN 重同步链路（RFC 4187 §10.6）由 SWu 用例的 `SEQ_CHECK=yes` 覆盖：
+UE 拒绝 SQN 并回 AKA-Synchronization-Failure，ePDG 把 AUTS 交给 HSS 重算后重新挑战。
+
+```bash
+sudo -E SWAN=/path/to/strongswan SEQ_CHECK=yes test/integration/swu_eap_aka.sh
+```
+
 ### 一站式验证
 
 ```bash
@@ -167,8 +187,10 @@ make -f deploy/Makefile lab-ui       # 配置台 http://127.0.0.1:8088
 - **唯一事实来源是 `deploy/lab.yaml`**：网桥与各容器地址、PLMN、订户密钥、
   ePDG / Open5GS / 基站参数都在这里；`labctl render` 生成 `deploy/.env`
   （compose 用）与 `deploy/runtime/`（容器挂载用）。
-- **配置台**（`labctl serve`）按域分成 Open5GS、基站（srsRAN eNB）、ePDG 三块，
-  外加网络与 PLMN 两节。保存只写 `lab.yaml`，"生成配置"才写 `runtime/`，
+- **配置台**（`labctl serve`）按域分成 Open5GS、基站（srsRAN eNB）、ePDG、IMS
+  （Kamailio CSCF）四块，外加网络与 PLMN 两节。IMS 面板管理 IMS 域、P-CSCF/PCRF
+  的 FQDN、面向 HSS 的 Diameter 对端与 rtpengine 控制地址，`render` 会把这些值
+  写进 `runtime/kamailio/`。保存只写 `lab.yaml`，"生成配置"才写 `runtime/`，
   之后需要重启容器。校验在写入前完成，非法定义直接返回 422 与原因。
 - 详见 [deploy/README.md](deploy/README.md)，其中记录了容器内的一个已知限制
   （S-CSCF 首次注册时崩溃，属 Kamailio 侧分支缺陷，非编排问题）。

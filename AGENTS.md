@@ -126,7 +126,12 @@ sudo -E SWAN=<prefix> test/integration/swu_eap_aka.sh   # real end to end test
 
 Covered by `test/integration/ims_register.sh`: the full `401 -> 200 OK` REGISTER
 with real P/I/S-CSCF, real PyHSS over Cx, and a UE that answers the AKAv1-MD5
-challenge with RES derived through Milenage. Environment notes:
+challenge with RES derived through Milenage. `test/integration/ims_call.sh` goes
+one step further and completes a dialog (INVITE/180/200/ACK/BYE) between two
+registered UEs; because the repository has no UE-side IMS IPsec stack it relaxes
+only the *installed* CSCF configs (P-CSCF advertises its address in Path, the
+S-CSCF terminates local users, the subscribers use a minimal iFC), never the
+ones under `configs/`. Environment notes:
 
 - Kamailio and every IMS module the P/I/S-CSCF configs need are packaged
   (`kamailio-ims-modules`, `kamailio-mysql-modules`, `kamailio-extra-modules`,
@@ -220,6 +225,12 @@ make -j4 && make install
   of silently emitting a wrong address. New parameters must be added to the
   table anyway, or the UI would accept edits that never reach the containers -
   that bit `open5gs.mme.*` once.
+- **The IMS panel is the fourth domain.** `lab.yaml`'s `ims` section owns the IMS
+  domain, the P-CSCF/PCRF Diameter FQDNs, the HSS peer and the rtpengine control
+  address; `renderKamailio` applies them through the same substitution list, and
+  `internal/lab/lab_test.go` asserts the values reach the rendered files. The
+  fields default from the PLMN (`applyDefaults`) so a pre-existing `lab.yaml`
+  still renders.
 - **Containers cannot share a static IP.** PyHSS is three processes that must
   answer on one address, so they run in a single container with a small
   supervisor in the entrypoint. Three compose services with the same
