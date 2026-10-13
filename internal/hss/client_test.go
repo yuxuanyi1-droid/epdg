@@ -85,3 +85,49 @@ func TestVectorParsesAKAArray(t *testing.T) {
 		t.Errorf("decoded vector has wrong field lengths: %+v", v)
 	}
 }
+
+// TestVectorAcceptsVariableXRESLengths pins the XRES length check (3GPP TS
+// 33.102 section 6.3.2): RES/XRES may be 32 to 128 bits, i.e. 4 to 16 octets,
+// depending on the operator's Milenage configuration.
+func TestVectorAcceptsVariableXRESLengths(t *testing.T) {
+	for _, xres := range []string{
+		"01020304",                         // 4 octets (32 bits, the minimum)
+		"0102030405060708",                 // 8 octets (the usual Milenage default)
+		"0102030405060708090a0b0c0d0e0f10", // 16 octets (128 bits, the maximum)
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(`[{"rand":"00112233445566778899aabbccddeeff",` +
+				`"autn":"ffeeddccbbaa99887766554433221100",` +
+				`"xres":"` + xres + `",` +
+				`"ck":"11111111111111111111111111111111",` +
+				`"ik":"22222222222222222222222222222222"}]`))
+		}))
+		c := testClient(t, srv.URL, "")
+		v, err := c.Vector(context.Background(), "001010000000001")
+		if err != nil {
+			t.Errorf("xres of %d octets: %v", len(xres)/2, err)
+			srv.Close()
+			continue
+		}
+		if len(v.XRES) != len(xres)/2 {
+			t.Errorf("xres of %d octets decoded as %d", len(xres)/2, len(v.XRES))
+		}
+		srv.Close()
+	}
+
+	// Outside the range the vector is unusable for EAP-AKA and must be refused.
+	for _, xres := range []string{"010203", "0102030405060708090a0b0c0d0e0f1011"} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(`[{"rand":"00112233445566778899aabbccddeeff",` +
+				`"autn":"ffeeddccbbaa99887766554433221100",` +
+				`"xres":"` + xres + `",` +
+				`"ck":"11111111111111111111111111111111",` +
+				`"ik":"22222222222222222222222222222222"}]`))
+		}))
+		c := testClient(t, srv.URL, "")
+		if _, err := c.Vector(context.Background(), "001010000000001"); err == nil {
+			t.Errorf("xres of %d octets was accepted", len(xres)/2)
+		}
+		srv.Close()
+	}
+}

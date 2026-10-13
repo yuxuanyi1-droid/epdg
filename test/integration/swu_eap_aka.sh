@@ -394,7 +394,6 @@ radius:
   listen: 127.0.0.1:$RADIUS_PORT
   secret: $RADIUS_SECRET
   realm: localdomain
-  require_message_authenticator: true
 protocol:
   plmn:
     mcc: "001"

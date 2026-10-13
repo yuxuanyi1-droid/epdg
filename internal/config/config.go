@@ -99,9 +99,6 @@ type RADIUS struct {
 	Secret string `yaml:"secret"`
 	// Realm is advertised in the RADIUS realm handling of the identity.
 	Realm string `yaml:"realm"`
-	// RequireMessageAuthenticator rejects requests without a valid
-	// Message-Authenticator (RFC 3579 section 3.2).
-	RequireMessageAuthenticator bool `yaml:"require_message_authenticator"`
 	// SendCheckcode includes AT_CHECKCODE in the AKA challenge when true. The
 	// checkcode is a SHA-1 over the EAP-AKA-Identity messages exchanged; this
 	// server uses EAP-Response/Identity instead, so the attribute is emitted
@@ -215,10 +212,9 @@ func Default() *Config {
 			},
 		},
 		RADIUS: RADIUS{
-			Backend:                     "noop",
-			Listen:                      "127.0.0.1:18120",
-			Secret:                      "pyhss-radius-secret",
-			RequireMessageAuthenticator: true,
+			Backend: "noop",
+			Listen:  "127.0.0.1:18120",
+			Secret:  "pyhss-radius-secret",
 		},
 		Protocol: Protocol{
 			PLMN: PLMN{MCC: "001", MNC: "001"},

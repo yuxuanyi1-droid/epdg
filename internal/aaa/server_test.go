@@ -59,7 +59,6 @@ func newTestServer(t *testing.T) *Server {
 	return NewServer(ServerConfig{
 		Listen:                      "127.0.0.1:0",
 		Secret:                      testSecret,
-		RequireMessageAuthenticator: true,
 		SessionTTL:                  time.Minute,
 	}, recordedSource{vector: recordedVector}, discardLogger())
 }
@@ -218,7 +217,6 @@ func TestAKASynchronizationFailureResync(t *testing.T) {
 	}
 	server := NewServer(ServerConfig{
 		Secret:                      testSecret,
-		RequireMessageAuthenticator: true,
 		SessionTTL:                  time.Minute,
 	}, source, discardLogger())
 	ctx := context.Background()

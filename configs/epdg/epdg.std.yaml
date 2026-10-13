@@ -30,7 +30,6 @@ radius:
   listen: 127.0.0.1:18120
   secret: pyhss-radius-secret
   realm: localdomain
-  require_message_authenticator: true
 protocol:
   plmn:
     mcc: "001"

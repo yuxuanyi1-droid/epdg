@@ -102,7 +102,6 @@ radius:
   listen: {{ .Lab.EPDG.RADIUS.Listen }}
   secret: {{ .Lab.Credentials.RadiusSecret }}
   realm: {{ .Lab.EPDG.AAA.OriginRealm }}
-  require_message_authenticator: true
 protocol:
   plmn:
     mcc: "{{ .Lab.PLMN.MCC }}"

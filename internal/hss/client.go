@@ -159,7 +159,7 @@ func decodeVector(raw akaVectorJSON) (*Vector, error) {
 	}{
 		{"rand", raw.RAND, 16, &v.RAND},
 		{"autn", raw.AUTN, 16, &v.AUTN},
-		{"xres", raw.XRES, 8, &v.XRES},
+		{"xres", raw.XRES, 0, &v.XRES},
 		{"ck", raw.CK, 16, &v.CK},
 		{"ik", raw.IK, 16, &v.IK},
 	} {
@@ -170,7 +170,13 @@ func decodeVector(raw akaVectorJSON) (*Vector, error) {
 		if err != nil {
 			return nil, fmt.Errorf("hss: AKA vector field %s is not hex: %w", f.name, err)
 		}
-		if len(b) != f.want {
+		if f.name == "xres" {
+			// TS 33.102 allows the RES/XRES length to vary between 32 and 128
+			// bits, so the AuC's configuration decides the exact size here.
+			if l := len(b); l < 4 || l > 16 {
+				return nil, fmt.Errorf("hss: AKA vector field %s is %d octets, outside the 4..16 octet range of TS 33.102", f.name, l)
+			}
+		} else if len(b) != f.want {
 			return nil, fmt.Errorf("hss: AKA vector field %s is %d octets, want %d", f.name, len(b), f.want)
 		}
 		*f.out = b

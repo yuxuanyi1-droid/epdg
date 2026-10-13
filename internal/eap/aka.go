@@ -176,6 +176,9 @@ type Response struct {
 	Notification    *uint16
 	ClientErrorCode *uint16
 	Identity        string
+	// SelectedVersion carries the AT_SELECTED_VERSION value of a Challenge
+	// response, when the peer included one (RFC 4187 section 10.21).
+	SelectedVersion *uint16
 }
 
 // ParseResponse decodes an EAP-Response of method type AKA (or AKA').
@@ -242,6 +245,12 @@ func ParseResponse(raw []byte) (*Response, error) {
 				}
 				resp.Identity = string(a.Value[2 : 2+n])
 			}
+		case ATSelectedVersion:
+			if len(a.Value) < 2 {
+				return nil, errors.New("eap-aka: AT_SELECTED_VERSION too short")
+			}
+			v := binary.BigEndian.Uint16(a.Value[0:2])
+			resp.SelectedVersion = &v
 		}
 	}
 	return resp, nil

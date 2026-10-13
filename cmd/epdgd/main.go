@@ -83,12 +83,11 @@ func run(path string, logger *slog.Logger) error {
 			return errors.New("radius backend eap_aka requires aaa backend pyhss_api")
 		}
 		radiusServer = aaa.NewServer(aaa.ServerConfig{
-			Listen:                      cfg.RADIUS.Listen,
-			Secret:                      cfg.RADIUS.Secret,
-			Realm:                       cfg.RADIUS.Realm,
-			RequireMessageAuthenticator: cfg.RADIUS.RequireMessageAuthenticator,
-			SendCheckcode:               cfg.RADIUS.SendCheckcode,
-			MaxRounds:                   cfg.AAA.EAPMaxRounds,
+			Listen:        cfg.RADIUS.Listen,
+			Secret:        cfg.RADIUS.Secret,
+			Realm:         cfg.RADIUS.Realm,
+			SendCheckcode: cfg.RADIUS.SendCheckcode,
+			MaxRounds:     cfg.AAA.EAPMaxRounds,
 		}, hssClient, logger.With("component", "radius"))
 
 		errCh := make(chan error, 1)

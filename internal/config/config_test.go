@@ -41,9 +41,6 @@ func TestProductionProfileMatchesTheLayer(t *testing.T) {
 	if cfg.RADIUS.Backend != "eap_aka" {
 		t.Errorf("radius.backend = %q, want eap_aka", cfg.RADIUS.Backend)
 	}
-	if !cfg.RADIUS.RequireMessageAuthenticator {
-		t.Error("radius.require_message_authenticator must default to true for EAP")
-	}
 	// The SWm flavoured endpoint omits CK and IK, so the AKA endpoint must be
 	// the one used to source vectors.
 	if cfg.AAA.PyHSS.VectorPathTemplate != "/auc/aka/vector_count/1/imsi/{imsi}" {

@@ -10,6 +10,7 @@ package aaa
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
@@ -33,13 +34,12 @@ type VectorSource interface {
 
 // ServerConfig configures the RADIUS server.
 type ServerConfig struct {
-	Listen                      string
-	Secret                      string
-	Realm                       string
-	RequireMessageAuthenticator bool
-	SendCheckcode               bool
-	MaxRounds                   int
-	SessionTTL                  time.Duration
+	Listen        string
+	Secret        string
+	Realm         string
+	SendCheckcode bool
+	MaxRounds     int
+	SessionTTL    time.Duration
 }
 
 // Server is a RADIUS authentication server speaking EAP-AKA.
@@ -50,18 +50,67 @@ type Server struct {
 
 	mu       sync.Mutex
 	sessions map[string]*akaSession
+	replies  map[string]cachedReply
+	// reauth maps a fast re-authentication identity to the session it was
+	// issued for. The session keeps the MK, K_aut and K_encr of the preceding
+	// full authentication (RFC 4187 section 5.1).
+	reauth map[string]*akaSession
 }
 
 // akaSession holds the state bound to one RADIUS State attribute.
 type akaSession struct {
-	imsi      string
-	identity  string
-	xres      []byte
-	kAut      []byte
-	msk       []byte
+	imsi string
+	// identity is the identity string the peer presented in this exchange, the
+	// input to MK and therefore to every key derived from it.
+	identity string
+	xres     []byte
+	kEncr    []byte
+	kAut     []byte
+	msk      []byte
+	// mk is kept so a later fast re-authentication can derive fresh MSK/EMSK.
+	mk        []byte
 	rand      []byte
 	rounds    int
 	expiresAt time.Time
+	// nextCounter is the counter value this server will use on the next fast
+	// re-authentication. It starts at one after a full authentication and grows
+	// monotonically (RFC 4187 section 5.1).
+	nextCounter uint16
+	// pendingReauth is set while an EAP-Request/AKA-Reauthentication is
+	// outstanding under this State.
+	pendingReauth *pendingReauth
+}
+
+// pendingReauth holds the values an outstanding
+// EAP-Request/AKA-Reauthentication was built with (RFC 4187 section 5.4).
+type pendingReauth struct {
+	// identity is the fast re-authentication identity the peer presented.
+	identity string
+	// counter and nonceS are the values sent in the request; the response must
+	// echo the counter and its AT_MAC covers the nonce.
+	counter uint16
+	nonceS  []byte
+	// newID is the next one-time re-authentication identity issued in
+	// AT_NEXT_REAUTH_ID, registered only when the exchange succeeds.
+	newID string
+}
+
+// cachedReply remembers the reply sent to one Access-Request. UDP is
+// unreliable and RADIUS clients retransmit an identical request (same
+// Identifier and Request Authenticator) when a reply is lost, so the reply has
+// to be resent unchanged: reprocessing the request is impossible anyway once
+// the one-time State has been consumed, and would produce a spurious
+// Access-Reject (RFC 5080 section 2.2.2).
+type cachedReply struct {
+	reply     []byte
+	expiresAt time.Time
+}
+
+// replyCacheKey identifies one outstanding request by its RADIUS Identifier
+// and Request Authenticator, the same pair a client keeps constant across the
+// retransmissions of one request.
+func replyCacheKey(identifier uint8, authenticator [16]byte) string {
+	return string([]byte{identifier}) + string(authenticator[:])
 }
 
 // NewServer builds a RADIUS EAP-AKA server.
@@ -75,7 +124,14 @@ func NewServer(cfg ServerConfig, vectors VectorSource, log *slog.Logger) *Server
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{cfg: cfg, vectors: vectors, log: log, sessions: map[string]*akaSession{}}
+	return &Server{
+		cfg:      cfg,
+		vectors:  vectors,
+		log:      log,
+		sessions: map[string]*akaSession{},
+		replies:  map[string]cachedReply{},
+		reauth:   map[string]*akaSession{},
+	}
 }
 
 // ListenAndServe binds the UDP socket and serves until ctx is cancelled.
@@ -135,6 +191,16 @@ func (s *Server) reapLoop(ctx context.Context) {
 					delete(s.sessions, key)
 				}
 			}
+			for key, sess := range s.reauth {
+				if now.After(sess.expiresAt) {
+					delete(s.reauth, key)
+				}
+			}
+			for key, reply := range s.replies {
+				if now.After(reply.expiresAt) {
+					delete(s.replies, key)
+				}
+			}
 			s.mu.Unlock()
 		}
 	}
@@ -154,17 +220,36 @@ func (s *Server) Handle(ctx context.Context, raw []byte, from *net.UDPAddr) []by
 
 	// RFC 3579 section 3.1: an Access-Request carrying an EAP-Message without a
 	// Message-Authenticator SHOULD be silently discarded, and one whose
-	// Message-Authenticator does not verify MUST be silently discarded. The
-	// server therefore drops these packets rather than answering them.
-	if s.cfg.RequireMessageAuthenticator {
-		ok, err := radius.VerifyMessageAuthenticator(raw, []byte(s.cfg.Secret))
-		if err != nil {
-			s.log.Warn("radius: silently discarding a request without a Message-Authenticator", "peer", from.String(), "user", request.UserName())
-			return nil
-		}
-		if !ok {
-			s.log.Warn("radius: silently discarding a request with an invalid Message-Authenticator", "peer", from.String(), "user", request.UserName())
-			return nil
+	// Message-Authenticator does not verify MUST be silently discarded. This is
+	// unconditional: every Access-Request of an EAP exchange carries the
+	// attribute, so there is no legitimate peer to make an exception for.
+	ok, err := radius.VerifyMessageAuthenticator(raw, []byte(s.cfg.Secret))
+	if err != nil {
+		s.log.Warn("radius: silently discarding a request without a Message-Authenticator", "peer", from.String(), "user", request.UserName())
+		return nil
+	}
+	if !ok {
+		s.log.Warn("radius: silently discarding a request with an invalid Message-Authenticator", "peer", from.String(), "user", request.UserName())
+		return nil
+	}
+
+	// A retransmission carries the same Identifier and Request Authenticator as
+	// the original request, so if a reply was already computed for the pair,
+	// resend it instead of reprocessing. The retransmission check has to sit
+	// after the Message-Authenticator verification so a spoofed replay cannot
+	// harvest replies it never saw the request for.
+	key := replyCacheKey(request.Identifier, request.Authenticator)
+	s.mu.Lock()
+	cached, found := s.replies[key]
+	s.mu.Unlock()
+	if found {
+		if time.Now().After(cached.expiresAt) {
+			s.mu.Lock()
+			delete(s.replies, key)
+			s.mu.Unlock()
+		} else {
+			s.log.Debug("radius: retransmission detected, resending the cached reply", "peer", from.String())
+			return cached.reply
 		}
 	}
 
@@ -192,9 +277,59 @@ func (s *Server) Handle(ctx context.Context, raw []byte, from *net.UDPAddr) []by
 	}
 }
 
-// handleIdentity answers an EAP-Response/Identity with an AKA challenge.
+// handleIdentity answers an EAP-Response/Identity. RFC 4187 section 4.1.3
+// allows this packet to carry the permanent identity, a pseudonym or a fast
+// re-authentication identity, so the server classifies it: a recognised fast
+// re-authentication identity starts the re-authentication exchange (section
+// 5.4), an unusable identity is answered with EAP-Request/AKA-Identity
+// (AT_ANY_ID_REQ) per section 4.1.4, and a permanent identity proceeds to a
+// full AKA challenge.
 func (s *Server) handleIdentity(ctx context.Context, request *radius.Packet, packet *eap.Packet) []byte {
 	identity := string(packet.Data)
+
+	// A fast re-authentication identity is a one-time identity this server
+	// issued in AT_NEXT_REAUTH_ID. The permanent NAI carries a 15 digit IMSI
+	// (with an optional leading marker), so anything that parses as one is
+	// never mistaken for a re-auth identity.
+	if _, err := imsiFromIdentity(identity); err != nil {
+		s.mu.Lock()
+		session, known := s.reauth[identity]
+		if known {
+			// Fast re-authentication identities are one-time: consume the
+			// identity so a replay cannot reuse it. If the exchange fails the
+			// peer falls back on full authentication.
+			delete(s.reauth, identity)
+		}
+		s.mu.Unlock()
+		if known {
+			if time.Now().After(session.expiresAt) {
+				// The re-auth identity expired: the keying material it pointed
+				// at must not be used any more, so ask for an identity again
+				// instead of running a re-authentication on stale keys.
+				s.log.Info("radius: expired fast re-authentication identity, requesting an identity via EAP-AKA-Identity", "identity", identity)
+				idReq, err := eap.BuildIdentityRequest(eapIdentifier(request.EAPMessage())+1, eap.ATAnyIDReq)
+				if err != nil {
+					return s.reject(request, "cannot build the AKA-Identity request")
+				}
+				return s.challenge(request, nil, idReq)
+			}
+			return s.startReauthentication(request, identity, session)
+		} else {
+			s.log.Info("radius: unknown identity, requesting one via EAP-AKA-Identity", "identity", identity)
+			idReq, err := eap.BuildIdentityRequest(eapIdentifier(request.EAPMessage())+1, eap.ATAnyIDReq)
+			if err != nil {
+				return s.reject(request, "cannot build the AKA-Identity request")
+			}
+			return s.challenge(request, nil, idReq)
+		}
+	}
+
+	return s.startFullAuthentication(ctx, request, identity, eapIdentifier(request.EAPMessage()))
+}
+
+// startFullAuthentication fetches a quintuplet for the identity's IMSI and
+// sends the AKA challenge.
+func (s *Server) startFullAuthentication(ctx context.Context, request *radius.Packet, identity string, baseIdentifier uint8) []byte {
 	imsi, err := imsiFromIdentity(identity)
 	if err != nil {
 		s.log.Warn("radius: reject, unusable identity", "identity", identity, "error", err)
@@ -207,7 +342,7 @@ func (s *Server) handleIdentity(ctx context.Context, request *radius.Packet, pac
 		return s.reject(request, "cannot obtain authentication vector")
 	}
 
-	keys, err := eap.DeriveKeys(identity, vector.IK, vector.CK)
+	keys, mk, err := eap.DeriveKeysWithMK(identity, vector.IK, vector.CK)
 	if err != nil {
 		s.log.Error("radius: cannot derive EAP-AKA keys", "imsi", imsi, "error", err)
 		return s.reject(request, "cannot derive EAP-AKA keys")
@@ -220,32 +355,22 @@ func (s *Server) handleIdentity(ctx context.Context, request *radius.Packet, pac
 	}
 
 	session := &akaSession{
-		imsi:      imsi,
-		identity:  identity,
-		xres:      vector.XRES,
-		kAut:      keys.KAut,
-		msk:       keys.MSK,
-		rand:      vector.RAND,
-		expiresAt: time.Now().Add(s.cfg.SessionTTL),
+		imsi:        imsi,
+		identity:    identity,
+		xres:        vector.XRES,
+		kEncr:       keys.KEncr,
+		kAut:        keys.KAut,
+		msk:         keys.MSK,
+		mk:          mk,
+		rand:        vector.RAND,
+		expiresAt:   time.Now().Add(s.cfg.SessionTTL),
+		nextCounter: 1,
 	}
 	s.mu.Lock()
 	s.sessions[hex.EncodeToString(state[:])] = session
 	s.mu.Unlock()
 
-	identifier := packet.Identifier + 1
-	var challenge []byte
-	if s.cfg.SendCheckcode {
-		// AT_CHECKCODE protects the EAP-AKA-Identity messages exchanged before
-		// keying material exists. This server authenticates the peer from an
-		// EAP-Response/Identity (RFC 3748 Type 1) rather than an
-		// EAP-Response/AKA-Identity, so no such messages were exchanged and the
-		// checkcode is empty. The attribute is still emitted, which is what the
-		// setting promises; an absent checkcode means "no AKA-Identity messages
-		// were exchanged" (RFC 4187 section 10.13).
-		challenge, err = eap.BuildChallengeWithCheckcode(identifier, vector.RAND, vector.AUTN, keys.KAut, []byte{})
-	} else {
-		challenge, err = eap.BuildChallenge(identifier, vector.RAND, vector.AUTN, keys.KAut)
-	}
+	challenge, err := s.buildChallenge(baseIdentifier+1, vector, keys)
 	if err != nil {
 		s.log.Error("radius: cannot build AKA challenge", "imsi", imsi, "error", err)
 		return s.reject(request, "cannot build AKA challenge")
@@ -255,11 +380,35 @@ func (s *Server) handleIdentity(ctx context.Context, request *radius.Packet, pac
 	return s.challenge(request, state[:], challenge)
 }
 
-// handleAKA processes the peer's EAP-AKA response.
+// buildChallenge assembles the EAP-Request/AKA-Challenge, honouring the
+// SendCheckcode setting.
+func (s *Server) buildChallenge(identifier uint8, vector *hss.Vector, keys *eap.Keys) ([]byte, error) {
+	if s.cfg.SendCheckcode {
+		// AT_CHECKCODE protects the EAP-AKA-Identity messages exchanged before
+		// keying material exists. The full authentication path here receives
+		// the identity via EAP-Response/Identity (RFC 3748 Type 1) rather than
+		// an EAP-Response/AKA-Identity, so no such messages were exchanged and
+		// the checkcode is empty; an absent checkcode means "no AKA-Identity
+		// messages were exchanged" (RFC 4187 section 10.13).
+		return eap.BuildChallengeWithCheckcode(identifier, vector.RAND, vector.AUTN, keys.KAut, []byte{})
+	}
+	return eap.BuildChallenge(identifier, vector.RAND, vector.AUTN, keys.KAut)
+}
+
+// handleAKA processes the peer's EAP-AKA response. The State attribute binds
+// the request to the pending session; EAP-Response/AKA-Identity is the one
+// subtype that may arrive without a State because it answers the identity
+// request this server sent with a nil State.
 func (s *Server) handleAKA(ctx context.Context, request *radius.Packet, eapBytes []byte, packet *eap.Packet) []byte {
 	stateRaw, ok := request.Get(radius.AttrState)
 	if !ok || len(stateRaw) == 0 {
-		return s.reject(request, "State attribute required for an AKA response")
+		// RFC 4187 section 9.2: the response to an EAP-Request/AKA-Identity.
+		// This server only issues one with AT_ANY_ID_REQ and without a State.
+		response, err := eap.ParseResponse(eapBytes)
+		if err != nil || response.Subtype != eap.SubtypeIdentity {
+			return s.reject(request, "State attribute required for an AKA response")
+		}
+		return s.handleAKAIdentity(ctx, request, response, eapIdentifier(eapBytes))
 	}
 	key := hex.EncodeToString(stateRaw)
 
@@ -288,6 +437,8 @@ func (s *Server) handleAKA(ctx context.Context, request *radius.Packet, eapBytes
 	switch response.Subtype {
 	case eap.SubtypeChallenge:
 		return s.finishChallenge(request, session, eapBytes, response)
+	case eap.SubtypeReauthentication:
+		return s.finishReauthentication(request, session, eapBytes)
 	case eap.SubtypeSynchronizationFailure:
 		return s.handleResync(ctx, request, session, response, eapIdentifier(eapBytes))
 	case eap.SubtypeAuthenticationReject:
@@ -306,24 +457,172 @@ func (s *Server) handleAKA(ctx context.Context, request *radius.Packet, eapBytes
 	}
 }
 
+// handleAKAIdentity processes an EAP-Response/AKA-Identity, which answers an
+// EAP-Request/AKA-Identity this server issued after an unrecognisable identity
+// (RFC 4187 sections 4.1.4 and 9.2). The peer is given one chance to present a
+// usable identity; requesting it again would violate the sequencing rules of
+// section 9.1, so a second unusable identity is a fatal error.
+func (s *Server) handleAKAIdentity(ctx context.Context, request *radius.Packet, response *eap.Response, baseIdentifier uint8) []byte {
+	if response.Identity == "" {
+		s.log.Warn("radius: reject, AKA-Identity response without AT_IDENTITY")
+		return s.reject(request, "AT_IDENTITY required in EAP-Response/AKA-Identity")
+	}
+	if _, err := imsiFromIdentity(response.Identity); err != nil {
+		s.log.Warn("radius: reject, unusable identity from AKA-Identity", "error", err)
+		return s.reject(request, "identity does not carry a usable IMSI")
+	}
+	// RFC 4187 section 7: MK is derived from the identity of the last
+	// AT_IDENTITY, so the full authentication uses this identity string.
+	return s.startFullAuthentication(ctx, request, response.Identity, baseIdentifier)
+}
+
+// finishReauthentication completes a fast re-authentication (RFC 4187
+// section 5.4): the response must verify with the K_aut of the full
+// authentication (its AT_MAC covers the packet plus the NONCE_S of the
+// request), the encrypted AT_COUNTER must echo the value that was sent, and a
+// counter that is not accepted is reported with AT_COUNTER_TOO_SMALL, which
+// falls back on full authentication.
+func (s *Server) finishReauthentication(request *radius.Packet, session *akaSession, eapBytes []byte) []byte {
+	pending := session.pendingReauth
+	if pending == nil {
+		s.log.Warn("radius: reject, re-authentication response without a pending re-authentication", "imsi", session.imsi)
+		return s.reject(request, "unexpected EAP-Response/AKA-Reauthentication")
+	}
+
+	keys := &eap.Keys{KEncr: session.kEncr, KAut: session.kAut}
+	counter, counterTooSmall, err := eap.VerifyReauthenticationResponse(eapBytes, keys, pending.nonceS)
+	if err != nil {
+		s.log.Warn("radius: reject, re-authentication verification failed", "imsi", session.imsi, "error", err)
+		return s.reject(request, "re-authentication verification failed: "+err.Error())
+	}
+	if counterTooSmall {
+		// RFC 4187 section 5.5: the peer did not accept the counter, so a full
+		// authentication follows.
+		s.log.Info("radius: AT_COUNTER_TOO_SMALL, falling back on full authentication", "imsi", session.imsi)
+		return s.startFullAuthentication(context.Background(), request, session.identity, eapIdentifier(eapBytes))
+	}
+	if counter != pending.counter {
+		s.log.Warn("radius: reject, echoed counter does not match", "imsi", session.imsi,
+			"echoed", counter, "sent", pending.counter)
+		return s.reject(request, "AT_COUNTER does not match the request")
+	}
+
+	// Derive the new MSK/EMSK from the original MK, the counter and the
+	// NONCE_S; K_encr and K_aut carry over (RFC 4187 section 7).
+	reauthKeys, err := eap.DeriveReauthKeys(pending.identity, counter, pending.nonceS, session.mk)
+	if err != nil {
+		s.log.Error("radius: cannot derive the re-authentication keys", "imsi", session.imsi, "error", err)
+		return s.reject(request, "cannot derive the re-authentication keys")
+	}
+	msk, err := radius.MPPEKeyAttributes(reauthKeys.MSK, []byte(s.cfg.Secret), request.Authenticator)
+	if err != nil {
+		s.log.Error("radius: cannot build MS-MPPE attributes", "imsi", session.imsi, "error", err)
+		return s.reject(request, "internal error")
+	}
+
+	// Register the new one-time re-authentication identity for the next
+	// exchange, continuing the counter sequence.
+	s.mu.Lock()
+	s.reauth[pending.newID] = &akaSession{
+		imsi:        session.imsi,
+		identity:    session.identity,
+		kEncr:       session.kEncr,
+		kAut:        session.kAut,
+		mk:          session.mk,
+		rounds:      session.rounds,
+		expiresAt:   time.Now().Add(s.cfg.SessionTTL),
+		nextCounter: session.nextCounter + 1,
+	}
+	s.mu.Unlock()
+
+	s.log.Info("radius: fast re-authentication success", "imsi", session.imsi, "counter", counter)
+	return s.accept(request, eap.Success(eapIdentifier(eapBytes)), msk...)
+}
+
+// startReauthentication sends the EAP-Request/AKA-Reauthentication for a
+// recognised fast re-authentication identity (RFC 4187 section 5.4). The
+// request carries a fresh counter, a fresh NONCE_S and a new one-time
+// re-authentication identity, all protected by the K_encr and K_aut of the
+// preceding full authentication, which the session stored.
+func (s *Server) startReauthentication(request *radius.Packet, reauthID string, session *akaSession) []byte {
+	if session.rounds >= s.cfg.MaxRounds {
+		s.log.Warn("radius: too many EAP rounds, falling back on full authentication", "imsi", session.imsi)
+		return s.reject(request, "too many EAP-AKA rounds")
+	}
+
+	state, err := radius.RandomAuthenticator()
+	if err != nil {
+		s.log.Error("radius: cannot generate State", "error", err)
+		return s.reject(request, "internal error")
+	}
+	newReauthID, err := newReauthIdentity()
+	if err != nil {
+		s.log.Error("radius: cannot generate a re-authentication identity", "error", err)
+		return s.reject(request, "internal error")
+	}
+
+	keys := &eap.Keys{KEncr: session.kEncr, KAut: session.kAut}
+	req, err := eap.BuildReauthenticationRequest(eapIdentifier(request.EAPMessage())+1, keys, session.nextCounter, newReauthID)
+	if err != nil {
+		s.log.Error("radius: cannot build the re-authentication request", "imsi", session.imsi, "error", err)
+		return s.reject(request, "cannot build the re-authentication request")
+	}
+
+	// The pending exchange is tracked under the new State attribute; the
+	// consumed re-auth identity has already been deleted by the caller.
+	s.mu.Lock()
+	s.sessions[hex.EncodeToString(state[:])] = &akaSession{
+		imsi:         session.imsi,
+		identity:     session.identity,
+		kEncr:        session.kEncr,
+		kAut:         session.kAut,
+		mk:           session.mk,
+		rounds:       session.rounds + 1,
+		expiresAt:    time.Now().Add(s.cfg.SessionTTL),
+		nextCounter:  session.nextCounter,
+		pendingReauth: &pendingReauth{
+			identity: reauthID,
+			counter:  req.Counter,
+			nonceS:   req.NonceS,
+			newID:    newReauthID,
+		},
+	}
+	s.mu.Unlock()
+
+	s.log.Info("radius: fast re-authentication request", "imsi", session.imsi, "counter", req.Counter)
+	return s.challenge(request, state[:], req.Raw)
+}
+
 func (s *Server) finishChallenge(request *radius.Packet, session *akaSession, eapBytes []byte, response *eap.Response) []byte {
+	// RFC 4187 section 10.21: when the peer includes AT_SELECTED_VERSION it
+	// echoes one of the versions this server advertised. Version 1 is the only
+	// version EAP-AKA defines, so anything else is a protocol violation.
+	if response.SelectedVersion != nil && *response.SelectedVersion != 1 {
+		s.log.Warn("radius: reject, unsupported EAP-AKA version selected", "imsi", session.imsi, "version", *response.SelectedVersion)
+		return s.reject(request, fmt.Sprintf("unsupported EAP-AKA version %d", *response.SelectedVersion))
+	}
 	if response.MAC == nil {
 		s.log.Warn("radius: reject, AT_MAC missing", "imsi", session.imsi)
 		return s.reject(request, "AT_MAC attribute required")
 	}
-	received, expected, macOK, err := eap.VerifyMAC(eapBytes, session.kAut)
+	received, _, macOK, err := eap.VerifyMAC(eapBytes, session.kAut)
 	if err != nil {
 		s.log.Warn("radius: reject, cannot verify AT_MAC", "imsi", session.imsi, "error", err)
 		return s.reject(request, "cannot verify AT_MAC")
 	}
 	resOK := subtle.ConstantTimeCompare(response.RES, session.xres) == 1
 
-	s.log.Info("radius: verifying AKA response",
+	// Only the verdict is logged, never the values themselves: RES and XRES are
+	// proof-of-possession of the subscriber key K, and the MAC values would let
+	// an offline attacker verify guesses. At debug level the lengths are shown
+	// so a wire-format mismatch remains diagnosable.
+	s.log.Debug("radius: verifying AKA response",
 		"imsi", session.imsi,
-		"res", hex.EncodeToString(response.RES),
-		"xres", hex.EncodeToString(session.xres),
-		"mac_received", hex.EncodeToString(received),
-		"mac_expected", hex.EncodeToString(expected),
+		"res_len", len(response.RES),
+		"xres_len", len(session.xres),
+		"mac_len", len(received),
+		"res_match", resOK,
+		"mac_match", macOK,
 	)
 
 	if !macOK || !resOK {
@@ -340,8 +639,52 @@ func (s *Server) finishChallenge(request *radius.Packet, session *akaSession, ea
 		s.log.Error("radius: cannot build MS-MPPE attributes", "imsi", session.imsi, "error", err)
 		return s.reject(request, "internal error")
 	}
+
+	// RFC 4187 section 5.3: issuing AT_NEXT_REAUTH_ID marks the server as
+	// willing to fast re-authenticate. The identity is one-time and is
+	// registered here so the next EAP-Response/Identity carrying it resolves.
+	if err := s.issueReauthIdentity(session); err != nil {
+		s.log.Error("radius: cannot issue a re-authentication identity", "imsi", session.imsi, "error", err)
+		return s.reject(request, "internal error")
+	}
+
 	s.log.Info("radius: AKA success", "imsi", session.imsi, "identity", session.identity)
 	return s.accept(request, eap.Success(eapIdentifier(eapBytes)), keys...)
+}
+
+// issueReauthIdentity generates the one-time fast re-authentication identity
+// the peer will use on its next authentication. It is generated per full
+// authentication and stored with the session that holds the MK, K_encr and
+// K_aut (RFC 4187 section 5.1).
+func (s *Server) issueReauthIdentity(session *akaSession) error {
+	id, err := newReauthIdentity()
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.reauth[id] = &akaSession{
+		imsi:        session.imsi,
+		identity:    session.identity,
+		kEncr:       session.kEncr,
+		kAut:        session.kAut,
+		mk:          session.mk,
+		rounds:      session.rounds,
+		expiresAt:   time.Now().Add(s.cfg.SessionTTL),
+		nextCounter: 1,
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+// newReauthIdentity returns a random one-time fast re-authentication
+// username. RFC 4187 section 5.3 requires a realm portion where the
+// environment needs one, so the configured realm is appended.
+func newReauthIdentity() (string, error) {
+	var raw [8]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("radius: cannot read randomness: %w", err)
+	}
+	return hex.EncodeToString(raw[:]), nil
 }
 
 // handleResync deals with an AKA-Synchronization-Failure carrying AT_AUTS
@@ -366,17 +709,20 @@ func (s *Server) handleResync(ctx context.Context, request *radius.Packet, sessi
 		s.log.Warn("radius: reject, cannot obtain a resynchronised vector", "imsi", session.imsi, "error", err)
 		return s.reject(request, "cannot obtain a resynchronised vector")
 	}
-	keys, err := eap.DeriveKeys(session.identity, vector.IK, vector.CK)
+	keys, mk, err := eap.DeriveKeysWithMK(session.identity, vector.IK, vector.CK)
 	if err != nil {
 		return s.reject(request, "cannot derive EAP-AKA keys")
 	}
 
 	session.xres = vector.XRES
+	session.kEncr = keys.KEncr
 	session.kAut = keys.KAut
 	session.msk = keys.MSK
+	session.mk = mk
 	session.rand = vector.RAND
 	session.rounds++
 	session.expiresAt = time.Now().Add(s.cfg.SessionTTL)
+	session.nextCounter = 1
 
 	// A new Request must use a fresh Identifier, not the one the peer echoed.
 	identifier := baseIdentifier + 1
@@ -428,10 +774,14 @@ func (s *Server) accept(request *radius.Packet, eapPayload []byte, attrs ...radi
 
 // challenge builds an Access-Challenge. Besides the EAP-Message it carries the
 // State attribute that binds the next Access-Request to this session (RFC 2865
-// section 5.24, RFC 3579). Reply-Message is forbidden alongside an EAP-Message
-// (RFC 3579 section 2.6.5).
+// section 5.24, RFC 3579); a nil state omits the attribute, which is what the
+// EAP-AKA-Identity round needs because there is nothing to bind yet.
+// Reply-Message is forbidden alongside an EAP-Message (RFC 3579 section 2.6.5).
 func (s *Server) challenge(request *radius.Packet, state []byte, eapPayload []byte) []byte {
-	attrs := []radius.Attribute{{Type: radius.AttrState, Value: state}}
+	var attrs []radius.Attribute
+	if state != nil {
+		attrs = append(attrs, radius.Attribute{Type: radius.AttrState, Value: state})
+	}
 	return s.reply(request, radius.CodeAccessChallenge, eapPayload, attrs...)
 }
 
@@ -450,6 +800,12 @@ func (s *Server) reply(request *radius.Packet, code uint8, eapPayload []byte, at
 		s.log.Error("radius: cannot encode reply", "error", err)
 		return nil
 	}
+	// Remember the reply so a retransmission of this request can be answered
+	// with the same datagram (RFC 5080 section 2.2.2).
+	key := replyCacheKey(request.Identifier, request.Authenticator)
+	s.mu.Lock()
+	s.replies[key] = cachedReply{reply: raw, expiresAt: time.Now().Add(s.cfg.SessionTTL)}
+	s.mu.Unlock()
 	return raw
 }
 
