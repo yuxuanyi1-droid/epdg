@@ -244,7 +244,7 @@ ON CONFLICT(ims_subscriber_id) DO UPDATE SET
 type kamailioRole struct {
 	name     string
 	self     string
-	ports    []string
+	port     int
 	acceptor string
 }
 
@@ -255,15 +255,16 @@ func (r *Renderer) renderKamailio() error {
 	lab := r.Lab
 	mariadb := lab.Network.Node("mariadb")
 	dbPassword := lab.Credentials.KamailioDBPassword
+	kam := lab.IMS.Kamailio
 	icscf := lab.Network.Node("icscf")
 	scscf := lab.Network.Node("scscf")
 
 	roles := []kamailioRole{
-		{name: "pcscf", self: lab.Network.Node("pcscf"), ports: []string{"5060"},
+		{name: "pcscf", self: lab.Network.Node("pcscf"), port: kam.PCSCFPort,
 			acceptor: `<Acceptor port="3871" bind="11.22.33.44"/>`},
-		{name: "icscf", self: icscf, ports: []string{"5061", "4060"},
+		{name: "icscf", self: icscf, port: kam.ICSCFPort,
 			acceptor: `<Acceptor port="3869" bind="127.0.0.1"/>`},
-		{name: "scscf", self: scscf, ports: []string{"5062", "6060"},
+		{name: "scscf", self: scscf, port: kam.SCSCFPort,
 			acceptor: `<Acceptor port="3870" bind="127.0.0.1"/>`},
 	}
 
@@ -286,18 +287,32 @@ func (r *Renderer) renderKamailio() error {
 			// Database. The shipped configs point at a local mysqld.
 			{fmt.Sprintf("mysql://%s:heslo@127.0.0.1/%s", role.name, role.name),
 				fmt.Sprintf("mysql://%s:%s@%s/%s", role.name, dbPassword, mariadb, role.name)},
-			// Inter-CSCF routing: the P-CSCF needs the I-CSCF, the I-CSCF the S-CSCF.
-			// These come first so a node's own port substitutions below cannot
-			// capture another node's address.
-			{`sip:127.0.0.1:5061`, fmt.Sprintf("sip:%s:5061", icscf)},
-			{`$rd = "127.0.0.1:5062";`, fmt.Sprintf(`$rd = "%s:5062";`, scscf)},
-			{`1 sip:127.0.0.1:5062`, fmt.Sprintf("1 sip:%s:5062", scscf)},
+			// Inter-CSCF routing with configurable ports: map each peer's shipped
+			// port onto the peer's configured port first, so the peer references
+			// (dispatcher lists, setdsturi, $rd) follow lab.yaml and not the
+			// shipped numbers. Ordered before this node's own sockets.
+			{`sip:127.0.0.1:5061`, fmt.Sprintf("sip:%s:%d", icscf, kam.ICSCFPort)},
+			{`sip:127.0.0.1:5062`, fmt.Sprintf("sip:%s:%d", scscf, kam.SCSCFPort)},
+			{`"127.0.0.1:5061"`, fmt.Sprintf(`"%s:%d"`, icscf, kam.ICSCFPort)},
+			{`"127.0.0.1:5062"`, fmt.Sprintf(`"%s:%d"`, scscf, kam.SCSCFPort)},
 			// Listen sockets. The 10.x addresses were the tunnel and IPsec
 			// sockets of the single host lab; drop them entirely rather than
 			// remapping, otherwise the socket is declared twice on the same
 			// address and kamailio rejects the config.
 			{"listen=udp:10.255.0.1:5060\n", ""},
 			{"listen=udp:10.46.0.1:5060\n", ""},
+			// Core run parameters from ims.kamailio. The shipped configs carry
+			// per-role numbers (children 4/64/12, TCP_PROCESSES 16/3/3); the lab
+			// value overrides all three roles.
+			{"children=4\n", fmt.Sprintf("children=%d\n", kam.Children)},
+			{"children=64\n", fmt.Sprintf("children=%d\n", kam.Children)},
+			{"children=12\n", fmt.Sprintf("children=%d\n", kam.Children)},
+			{"#!define TCP_PROCESSES 16", fmt.Sprintf("#!define TCP_PROCESSES %d", kam.TCPChildren)},
+			{"#!define TCP_PROCESSES 3", fmt.Sprintf("#!define TCP_PROCESSES %d", kam.TCPChildren)},
+			// Both debug branches collapse onto the configured level, so the
+			// WITH_DEBUG ifdef no longer matters.
+			{"debug=5", fmt.Sprintf("debug=%d", kam.Debug)},
+			{"debug=2", fmt.Sprintf("debug=%d", kam.Debug)},
 			// Control and config paths move onto the container layout.
 			{`/etc/kamailio_` + role.name, `/etc/kamailio`},
 			{`/run/kamailio_` + role.name, `/run/kamailio`},
@@ -309,14 +324,18 @@ func (r *Renderer) renderKamailio() error {
 			{`shm_force_alloc=yes`, `shm_force_alloc=no`},
 			// The P-CSCF advertises itself to the I-CSCF; it must be routable.
 			{`#!define PCSCF_URL "sip:pcscf.localdomain"`,
-				fmt.Sprintf(`#!define PCSCF_URL "sip:%s:5060"`, lab.Network.Node("pcscf"))},
+				fmt.Sprintf(`#!define PCSCF_URL "sip:%s:%d"`, lab.Network.Node("pcscf"), kam.PCSCFPort)},
 		}
-		for _, port := range role.ports {
-			subs = append(subs,
-				[2]string{`listen=udp:127.0.0.1:` + port, fmt.Sprintf("listen=udp:%s:%s", role.self, port)},
-				[2]string{`listen=tcp:127.0.0.1:` + port, fmt.Sprintf("listen=tcp:%s:%s", role.self, port)},
-			)
-		}
+		own := strconv.Itoa(role.port)
+		subs = append(subs,
+			[2]string{`listen=udp:127.0.0.1:5060`, "listen=udp:" + role.self + ":" + own},
+			[2]string{`listen=udp:127.0.0.1:5061`, "listen=udp:" + role.self + ":" + own},
+			[2]string{`listen=udp:127.0.0.1:5062`, "listen=udp:" + role.self + ":" + own},
+			[2]string{`listen=tcp:127.0.0.1:5060`, "listen=tcp:" + role.self + ":" + own},
+			[2]string{`listen=tcp:127.0.0.1:5061`, "listen=tcp:" + role.self + ":" + own},
+			[2]string{`listen=tcp:127.0.0.1:6060`, "listen=tcp:" + role.self + ":" + own},
+			[2]string{`listen=tcp:127.0.0.1:4060`, "listen=tcp:" + role.self + ":" + own},
+		)
 		// The node's own SIP URI must name the address its peers can reach.
 		// `#!define URI "sip:127.0.0.1:5062"` feeds ims_auth's name and the
 		// registrar's scscf_name, which go into the Path header and the SAR. If
@@ -324,9 +343,7 @@ func (r *Renderer) renderKamailio() error {
 		// address, the registrar dereferences a lookup that cannot match and the
 		// S-CSCF dies on the first registration. Applied last so it only catches
 		// whatever the inter-node rules above did not already claim.
-		for _, port := range role.ports {
-			subs = append(subs, [2]string{"127.0.0.1:" + port, role.self + ":" + port})
-		}
+		subs = append(subs, [2]string{"127.0.0.1:5062", role.self + ":" + own})
 		// The Diameter acceptor binds the node address.
 		subs = append(subs, [2]string{role.acceptor,
 			strings.Replace(strings.Replace(role.acceptor, "11.22.33.44", role.self, 1),

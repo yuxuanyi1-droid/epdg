@@ -202,7 +202,7 @@ const SCHEMA = [
     id: "ims",
     num: "05",
     title: "IMS（Kamailio CSCF）",
-    note: "P/I/S-CSCF 的身份、面向 HSS/PCRF 的 Diameter 对端与 rtpengine 控制地址",
+    note: "P/I/S-CSCF 的身份、Diameter 对端、rtpengine 与 Kamailio 运行参数",
     groups: [
       {
         label: "IMS 身份",
@@ -223,6 +223,18 @@ const SCHEMA = [
         label: "媒体（rtpengine）",
         fields: [
           { key: "ims.rtpengine_address", label: "rtpengine 控制地址", type: "text", hint: "host:port，如 rtpengine:22222" },
+        ],
+      },
+      {
+        label: "Kamailio 运行参数",
+        note: "三个 CSCF 共用；改动后需点“生成配置”并重启容器",
+        fields: [
+          { key: "ims.kamailio.udp_children", label: "UDP 子进程数", type: "number", hint: "shipped 各为 4/64/12，默认取 64" },
+          { key: "ims.kamailio.tcp_children", label: "TCP 子进程数", type: "number", hint: "shipped 各为 16/3/3，默认取 16" },
+          { key: "ims.kamailio.debug", label: "日志级别", type: "number", hint: "0-5，2=INFO，3=DBG；排障时调高" },
+          { key: "ims.kamailio.pcscf_port", label: "P-CSCF 端口", type: "number" },
+          { key: "ims.kamailio.icscf_port", label: "I-CSCF 端口", type: "number" },
+          { key: "ims.kamailio.scscf_port", label: "S-CSCF 端口", type: "number" },
         ],
       },
     ],

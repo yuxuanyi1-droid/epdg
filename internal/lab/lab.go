@@ -174,6 +174,21 @@ type IMS struct {
 	// RTPEngineAddress is the rtpengine NG control endpoint (host:port) used
 	// for both the originating and terminating media sets.
 	RTPEngineAddress string `yaml:"rtpengine_address" json:"rtpengine_address"`
+	// Kamailio holds the run parameters the shipped CSCF configs expose:
+	// worker process counts, the log level, and each node's SIP ports.
+	Kamailio Kamailio `yaml:"kamailio" json:"kamailio"`
+}
+
+// Kamailio carries the CSCF core parameters the console exposes. The zero
+// values mean "keep what the shipped configs hard code", which applyDefaults
+// turns into the shipped numbers so the render never writes a 0 into a cfg.
+type Kamailio struct {
+	Children    int `yaml:"udp_children" json:"udp_children"`
+	TCPChildren int `yaml:"tcp_children" json:"tcp_children"`
+	Debug       int `yaml:"debug" json:"debug"`
+	PCSCFPort   int `yaml:"pcscf_port" json:"pcscf_port"`
+	ICSCFPort   int `yaml:"icscf_port" json:"icscf_port"`
+	SCSCFPort   int `yaml:"scscf_port" json:"scscf_port"`
 }
 
 // applyDefaults fills IMS fields that were not present in the YAML, deriving the
@@ -197,6 +212,28 @@ func (l *Lab) applyDefaults() {
 	}
 	if l.IMS.RTPEngineAddress == "" {
 		l.IMS.RTPEngineAddress = "localhost:9910"
+	}
+	// The shipped configs disagree on the worker counts (children=4 for the
+	// P-CSCF, 64 for the I-CSCF, 12 for the S-CSCF; TCP_PROCESSES 16/3/3). The
+	// lab default takes the largest so no node is starved when the value is
+	// shared; setting a value in lab.yaml overrides it for all three.
+	if l.IMS.Kamailio.Children == 0 {
+		l.IMS.Kamailio.Children = 64
+	}
+	if l.IMS.Kamailio.TCPChildren == 0 {
+		l.IMS.Kamailio.TCPChildren = 16
+	}
+	if l.IMS.Kamailio.Debug == 0 {
+		l.IMS.Kamailio.Debug = 2
+	}
+	if l.IMS.Kamailio.PCSCFPort == 0 {
+		l.IMS.Kamailio.PCSCFPort = 5060
+	}
+	if l.IMS.Kamailio.ICSCFPort == 0 {
+		l.IMS.Kamailio.ICSCFPort = 5061
+	}
+	if l.IMS.Kamailio.SCSCFPort == 0 {
+		l.IMS.Kamailio.SCSCFPort = 5062
 	}
 }
 
@@ -343,6 +380,32 @@ func validateIMS(ims IMS) error {
 	}
 	if _, _, err := net.SplitHostPort(ims.RTPEngineAddress); err != nil {
 		return fmt.Errorf("ims.rtpengine_address %q must be host:port: %w", ims.RTPEngineAddress, err)
+	}
+	k := ims.Kamailio
+	if k.Children < 0 || k.Children > 128 {
+		return fmt.Errorf("ims.kamailio.udp_children %d must be between 0 and 128", k.Children)
+	}
+	if k.TCPChildren < 0 || k.TCPChildren > 128 {
+		return fmt.Errorf("ims.kamailio.tcp_children %d must be between 0 and 128", k.TCPChildren)
+	}
+	if k.Debug < 0 || k.Debug > 5 {
+		return fmt.Errorf("ims.kamailio.debug %d must be between 0 and 5 (kamailio's L_ERR..L_DBG)", k.Debug)
+	}
+	for _, p := range []struct {
+		key   string
+		value int
+	}{
+		{"ims.kamailio.pcscf_port", k.PCSCFPort},
+		{"ims.kamailio.icscf_port", k.ICSCFPort},
+		{"ims.kamailio.scscf_port", k.SCSCFPort},
+	} {
+		if p.value < 1 || p.value > 65535 {
+			return fmt.Errorf("%s %d must be between 1 and 65535", p.key, p.value)
+		}
+	}
+	if k.PCSCFPort == k.ICSCFPort || k.PCSCFPort == k.SCSCFPort || k.ICSCFPort == k.SCSCFPort {
+		return fmt.Errorf("ims.kamailio.{pcscf,icscf,scscf}_port must be distinct, got %d/%d/%d",
+			k.PCSCFPort, k.ICSCFPort, k.SCSCFPort)
 	}
 	return nil
 }
