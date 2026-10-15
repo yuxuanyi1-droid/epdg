@@ -17,3 +17,6 @@ deploy/.env
 
 # Lab verification artefacts
 deploy/runtime/verify-register.log
+
+# Runtime copy of the call-test iFC made by test/integration/ims_call.sh
+pyhss/_ims_call_ifc.xml

@@ -199,3 +199,53 @@ func TestLoadAppliesKamailioDefaults(t *testing.T) {
 		t.Errorf("ims.kamailio port defaults = %+v", k)
 	}
 }
+
+// TestSaveKeepsComments checks that a save made through the console merges the
+// values into the existing document instead of re-encoding it, so hand written
+// comments survive. This is what used to silently drop the note above
+// network.nodes.aaa on every UI save.
+func TestSaveKeepsComments(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lab.yaml")
+	src, err := os.ReadFile(filepath.Join(repoRoot(t), "deploy", "lab.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, src, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	def, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	// Edit through the "console": update an existing value and add a section
+	// (ims.kamailio) the document does not carry yet.
+	def.Network.Nodes["aaa"] = "10.99.0.99"
+	def.IMS.Kamailio.Children = 24
+	if err := def.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	out, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"# The Gx/S6b Diameter peer. Open5GS's PGW-C requires both before it will",
+		"aaa: 10.99.0.99",
+		"udp_children: 24",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("saved file lost %q; got:\n%s", want, text)
+		}
+	}
+	// The merged document must still parse and carry the new values.
+	again, err := Load(path)
+	if err != nil {
+		t.Fatalf("reload after save: %v", err)
+	}
+	if again.Network.Nodes["aaa"] != "10.99.0.99" || again.IMS.Kamailio.Children != 24 {
+		t.Errorf("reloaded values = %s/%d, want 10.99.0.99/24",
+			again.Network.Nodes["aaa"], again.IMS.Kamailio.Children)
+	}
+}

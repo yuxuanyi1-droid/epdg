@@ -257,21 +257,82 @@ func Load(path string) (*Lab, error) {
 }
 
 // Save writes the lab definition back, which is how the UI persists edits.
+//
+// When the file already exists the values are merged into the parsed document
+// node instead of marshalling from scratch, so hand written comments (and the
+// key order they are attached to) survive a save made through the console. The
+// managed-file header is only written when there was no document to merge into.
 func (l *Lab) Save(path string) error {
 	if err := l.Validate(); err != nil {
 		return err
 	}
-	body, err := yaml.Marshal(l)
+	var body []byte
+	var err error
+	var header string
+	if existing, rerr := os.ReadFile(path); rerr == nil && len(existing) > 0 {
+		var doc yaml.Node
+		if derr := yaml.Unmarshal(existing, &doc); derr != nil || len(doc.Content) == 0 {
+			return fmt.Errorf("lab: cannot re-read %s to preserve its comments: %w", path, derr)
+		}
+		if merr := mergeYAML(doc.Content[0], marshalNode(l)); merr != nil {
+			return fmt.Errorf("lab: cannot merge into %s: %w", path, merr)
+		}
+		body, err = yaml.Marshal(&doc)
+	} else {
+		body, err = yaml.Marshal(l)
+		header = "# Managed by labctl. Edit through the configuration UI or by hand;\n" +
+			"# `labctl render` regenerates deploy/.env and deploy/runtime from this file.\n"
+	}
 	if err != nil {
 		return fmt.Errorf("lab: cannot encode %s: %w", path, err)
 	}
-	header := "# Managed by labctl. Edit through the configuration UI or by hand;\n" +
-		"# `labctl render` regenerates deploy/.env and deploy/runtime from this file.\n"
 	tmp := filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".tmp")
-	if err := os.WriteFile(tmp, append([]byte(header), body...), 0o644); err != nil {
+	if os.WriteFile(tmp, append([]byte(header), body...), 0o644) != nil {
 		return fmt.Errorf("lab: cannot write %s: %w", tmp, err)
 	}
 	return os.Rename(tmp, path)
+}
+
+// marshalNode encodes lab into a node tree so mergeYAML can walk it.
+func marshalNode(l *Lab) *yaml.Node {
+	var node yaml.Node
+	b, err := yaml.Marshal(l)
+	if err != nil {
+		// Marshalling a validated struct cannot fail; a panic here is a bug.
+		panic(fmt.Sprintf("lab: internal encode error: %v", err))
+	}
+	if err := yaml.Unmarshal(b, &node); err != nil || len(node.Content) == 0 {
+		panic(fmt.Sprintf("lab: internal decode error: %v", err))
+	}
+	return node.Content[0]
+}
+
+// mergeYAML copies the values of fresh into doc in place: scalars and lists are
+// replaced, mappings are walked recursively, and keys that only exist in fresh
+// are appended. Comments and key order already in doc are left untouched.
+func mergeYAML(doc, fresh *yaml.Node) error {
+	if doc.Kind != yaml.MappingNode || fresh.Kind != yaml.MappingNode {
+		// A scalar or a list replaces the entry wholesale.
+		*doc = *fresh
+		return nil
+	}
+	for i := 0; i+1 < len(fresh.Content); i += 2 {
+		key, value := fresh.Content[i], fresh.Content[i+1]
+		found := false
+		for j := 0; j+1 < len(doc.Content); j += 2 {
+			if doc.Content[j].Value == key.Value {
+				found = true
+				if err := mergeYAML(doc.Content[j+1], value); err != nil {
+					return err
+				}
+				break
+			}
+		}
+		if !found {
+			doc.Content = append(doc.Content, key, value)
+		}
+	}
+	return nil
 }
 
 // Validate rejects definitions that would produce a broken stack.
